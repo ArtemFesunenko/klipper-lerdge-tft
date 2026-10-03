@@ -53,11 +53,17 @@ calibration measured on a real panel was within a few percent of this.
 | TF card (SDIO) | PC8–PC12, PD2 | PC8–PC12, PD2 | PC8–PC12, PD2 |
 | TF card detect | PA8 | PA8 | PG15 |
 | Beeper | PC7 | PD12 | PD13 |
-| Encoder (unused) | PG11, PG10, PG9 | PE4, PE3, PE2 | PC15, PC14, PC13 |
+| Knob module (encoder A, B, button) | PG11, PG10, PG9 | PE4, PE3, PE2 | PC15, PC14, PC13 |
 
 The board also has a 16 MiB SPI NOR flash (Winbond W25Q128, JEDEC
 `ef4018`) on SPI1 (PA5/PA6/PA7) with CS on PC4, where the stock firmware
 keeps its UI images and fonts.
+
+The knob module is an optional rotary encoder with a push button that is
+fitted to the touch screen; its signals go through the screen cable to the
+pins above. In KlipperScreen mode its events are forwarded through the
+`lerdge_tft` API and injected as Tab / Shift+Tab / Return / Escape key
+presses (KlipperScreen `keyboard_navigation`).
 
 ## Firmware encryption
 

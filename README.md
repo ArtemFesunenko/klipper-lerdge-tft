@@ -1,8 +1,9 @@
-# Klipper on Lerdge boards – with the stock touch screen
+# Klipper on Lerdge boards – with the stock Lerdge screen
 
 **English** | [Русский](README.ru.md)
 
-Use the original Lerdge touch screen with [Klipper](https://www.klipper3d.org/):
+Use the original Lerdge screen – the 3.5" color touch screen, with or
+without the Lerdge knob module – with [Klipper](https://www.klipper3d.org/):
 run a full [KlipperScreen](https://github.com/KlipperScreen/KlipperScreen) on
 it, or the built-in Klipper menu. Everything installs with one script.
 
@@ -51,6 +52,9 @@ it, or the built-in Klipper menu. Everything installs with one script.
   and tappable menu rows. Nothing extra runs on the host.
 - **Touch gestures** – tap to click, swipe to scroll lists, hold for a
   long press. Touch calibration with five targets.
+- **Knob module support** – the optional Lerdge rotary encoder with push
+  button works in both modes: it moves through the menu (or the buttons of
+  KlipperScreen), a click selects, a long click goes back.
 - **Works after errors** – the touch panel is read by the board itself, so
   after a Klipper shutdown you can still press *Firmware Restart* on the
   screen.
@@ -73,9 +77,12 @@ it, or the built-in Klipper menu. Everything installs with one script.
 | **Lerdge-X** | ⚠️ Should work, not tested | Same screen and bootloader layout; touch CS on PB6, no touch interrupt pin (pins from Marlin) |
 | Lerdge-S | ❌ Not supported by the installer | Same screen; bootloader file name unknown – see [docs/hardware.md](docs/hardware.md) |
 
-The screen is the standard Lerdge 3.5" 480×320 TFT (ST7796S controller,
-resistive XPT2046 touch). ILI9488 and ILI9341 based screens are supported by
-the driver too (detected automatically).
+Lerdge boards use one type of screen: the Lerdge 3.5" 480×320 color touch
+screen (ST7796S controller, resistive XPT2046 touch). Lerdge also sells a
+**knob module** – a rotary encoder with a push button that is fitted to the
+same touch screen (kit "screen + knob") – which is supported as well. There
+is no separate knob-only screen. ILI9488 and ILI9341 based screens are
+supported by the driver too (detected automatically).
 
 **Host:** any Linux computer that already runs Klipper and Moonraker
 (Raspberry Pi, Orange Pi, other single board computers or a PC) with a
@@ -142,6 +149,7 @@ The installer asks a few questions (all have sensible defaults):
 | --- | --- |
 | Board type | `k` for Lerdge-K, `x` for Lerdge-X |
 | Show KlipperScreen on the Lerdge screen | `y` for KlipperScreen, `n` for the built-in menu |
+| Knob module fitted | `y` if the Lerdge rotary encoder is installed on the screen |
 | MCU serial baud rate | `1500000` (recommended for KlipperScreen) or `250000` |
 | Firmware installation | `file` for the first installation, `sd` if the board already runs Klipper (and has a TF card) |
 
@@ -229,6 +237,17 @@ after 20 seconds and returns to KlipperScreen automatically.
 - ✓ – select (hold for a long click), ◄ – back
 - tap a menu row to select it, tap it again to activate it
 
+**Knob module**
+
+| Action | KlipperScreen mode | Built-in menu mode |
+| --- | --- | --- |
+| Turn | Move the highlight between buttons | Move in the menu / change the value |
+| Click | Press the highlighted button | Select |
+| Long click (0.8 s) | Back to the main screen | Long click (menu action) |
+
+If the screen backlight is off (`backlight_timeout`), the first touch or
+knob action only switches it on.
+
 **G-code commands**
 
 | Command | Description |
@@ -249,6 +268,8 @@ is included from `printer.cfg`. Useful options:
 | `backlight_timeout` | `0` | Switch the backlight off after this many seconds without touch (0 = never) |
 | `beeper_pin` | – | Short click on every touch (Lerdge-K: `PC7`, Lerdge-X: `PD12`) |
 | `touch_pressure_threshold` | `300` | Lower it if light touches are not detected |
+| `encoder_pins`, `click_pin` | commented out | Knob module (Lerdge-K: `^PG11, ^PG10` and `^!PG9`; Lerdge-X: `^PE4, ^PE3` and `^!PE2`) – enabled by the installer when you answer that the knob is fitted |
+| `encoder_steps_per_detent` | `4` | Set to `2` if one knob click moves two steps |
 | `controller` | `auto` | `st7796`, `ili9488` or `ili9341` if auto detection fails |
 | `invert_colors` | controller default | Fix inverted (negative) colors |
 | `background_color`, `text_color`, `button_color`, … | | Built-in menu colors (`RRGGBB`) |
@@ -339,6 +360,12 @@ slot. "Could not connect to the board": the board does not run Klipper
 still runs the old firmware after switching it off and on, check
 `~/printer_data/logs/lerdge-firmware.log` and that the `Lerdge_K_system`
 folder is in the root of the card.
+
+**The knob turns the wrong way**
+Swap the two pins in `encoder_pins` in `lerdge_tft.cfg`. To add the knob
+later, run the installer again and answer `y` to the knob question (or
+uncomment `encoder_pins`/`click_pin` and add `keyboard_navigation: True`
+to the `[main]` section of `KlipperScreen-lerdge.conf`).
 
 **The picture is upside down**
 Set `rotate_180: True` in `lerdge_tft.cfg`.

@@ -1,25 +1,26 @@
-From a3400688fd905cdb2b19e12dc2f290fdb353f71f Mon Sep 17 00:00:00 2001
+From 14de2868e427179f322ade79b4c9c3f649685e7a Mon Sep 17 00:00:00 2001
 From: Artem Fesunenko <body051@gmail.com>
-Date: Sat, 3 Oct 2026 08:19:39 +0300
+Date: Sat, 3 Oct 2026 15:40:05 +0300
 Subject: [PATCH 5/5] scripts: Add lerdge_mirror.py to show KlipperScreen on
  Lerdge TFTs
 
 Mirror an Xvfb display to the lerdge_tft module: changed regions are
 RLE encoded and sent through the Klipper API socket, and touch gestures
-are injected into X as clicks, mouse wheel scrolling and holds.
+are injected into X as clicks, mouse wheel scrolling and holds.  Knob
+(encoder) events become keyboard navigation (Tab, Return, Escape).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- scripts/lerdge_mirror.py | 409 +++++++++++++++++++++++++++++++++++++++
- 1 file changed, 409 insertions(+)
+ scripts/lerdge_mirror.py | 436 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 436 insertions(+)
  create mode 100644 scripts/lerdge_mirror.py
 
 diff --git a/scripts/lerdge_mirror.py b/scripts/lerdge_mirror.py
 new file mode 100644
-index 000000000..b01d3dc07
+index 000000000..1e6114382
 --- /dev/null
 +++ b/scripts/lerdge_mirror.py
-@@ -0,0 +1,409 @@
+@@ -0,0 +1,436 @@
 +#!/usr/bin/env python3
 +# Mirror an X display (for example KlipperScreen on Xvfb) to a Lerdge TFT
 +#
@@ -256,6 +257,16 @@ index 000000000..b01d3dc07
 +# Touch injection
 +######################################################################
 +
++# Knob (encoder) events from the Klipper menu keys, as keyboard navigation
++# for KlipperScreen ("keyboard_navigation: True"): (key name, with shift)
++KEY_MAP = {
++    'up': ('Tab', False), 'fast_up': ('Tab', False),
++    'down': ('Tab', True), 'fast_down': ('Tab', True),
++    'click': ('Return', False),
++    # Escape returns to the main screen from anywhere
++    'long_click': ('Escape', False), 'back': ('BackSpace', False),
++}
++
 +class TouchInjector:
 +    # A short touch becomes a click at the touch position, dragging the
 +    # finger scrolls (mouse wheel), holding it still presses the button.
@@ -263,9 +274,10 @@ index 000000000..b01d3dc07
 +    SCROLL_STEP = 24
 +    HOLD_TIME = 0.6
 +    def __init__(self, display_name):
-+        from Xlib import display as xdisplay, X
++        from Xlib import display as xdisplay, X, XK
 +        from Xlib.ext import xtest
 +        self.X = X
++        self.XK = XK
 +        self.xtest = xtest
 +        self.d = xdisplay.Display(display_name)
 +        self.state = None
@@ -281,8 +293,24 @@ index 000000000..b01d3dc07
 +        with self.lock:
 +            self._handle(params)
 +            self.d.sync()
++    def _key(self, name, shift=False):
++        X, xtest = self.X, self.xtest
++        code = self.d.keysym_to_keycode(self.XK.string_to_keysym(name))
++        shift_code = self.d.keysym_to_keycode(
++            self.XK.string_to_keysym('Shift_L'))
++        if shift:
++            xtest.fake_input(self.d, X.KeyPress, shift_code)
++        xtest.fake_input(self.d, X.KeyPress, code)
++        xtest.fake_input(self.d, X.KeyRelease, code)
++        if shift:
++            xtest.fake_input(self.d, X.KeyRelease, shift_code)
 +    def _handle(self, params):
 +        action = params.get('action')
++        if action == 'key':
++            key = KEY_MAP.get(params.get('key'))
++            if key is not None:
++                self._key(*key)
++            return
 +        if action == 'down':
 +            x, y = params['x'], params['y']
 +            self.state = 'pending'

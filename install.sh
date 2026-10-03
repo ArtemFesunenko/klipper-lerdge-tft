@@ -27,6 +27,7 @@ FALLBACK_BAUD=250000
 BOARD=""
 BAUD=""
 MIRROR=""
+KNOB=""
 FLASH=""
 SERIAL_DEV=""
 BASE_REF=""
@@ -91,6 +92,8 @@ Options:
   --baud N           MCU serial baud rate (250000 or 1500000)
   --mirror           Show KlipperScreen on the Lerdge screen
   --no-mirror        Use the built-in Klipper menu on the Lerdge screen
+  --knob             The Lerdge knob module (rotary encoder) is fitted
+  --no-knob          No knob module
   --flash sd|file|none
                      sd:   write the firmware to the TF card in the board
                            through the running firmware (the board must
@@ -117,6 +120,8 @@ while [ $# -gt 0 ]; do
         --baud) BAUD="$2"; shift;;
         --mirror) MIRROR=1;;
         --no-mirror) MIRROR=0;;
+        --knob) KNOB=1;;
+        --no-knob) KNOB=0;;
         --flash) FLASH="$2"; shift;;
         --serial) SERIAL_DEV="$2"; shift;;
         --base) BASE_REF="$2"; shift;;
@@ -148,6 +153,7 @@ save_state() {
 BOARD=$BOARD
 BAUD=$BAUD
 MIRROR=$MIRROR
+KNOB=$KNOB
 BASE=$BASE
 EOF
 }
@@ -161,6 +167,7 @@ load_state() {
             BOARD) [ -n "$BOARD" ] || BOARD="$value";;
             BAUD) [ -n "$BAUD" ] || BAUD="$value";;
             MIRROR) [ -n "$MIRROR" ] || MIRROR="$value";;
+            KNOB) [ -n "$KNOB" ] || KNOB="$value";;
             BASE) BASE="$value";;
         esac
     done < "$STATE_FILE"
@@ -236,7 +243,8 @@ check_environment() {
     fi
     info "Klipper:     $KLIPPER_DIR ($(klipper_version))"
     info "Config:      $PRINTER_CFG"
-    if [ "$DO_SERVICES" = "1" ] || [ "$MODE" != "finish" ]; then
+    if [ "$MODE" != "build" ] \
+            && { [ "$DO_SERVICES" = "1" ] || [ "$MODE" != "finish" ]; }; then
         # Ask for the sudo password once, before anything is changed
         if ! sudo -n true 2>/dev/null; then
             info "Some steps need administrator rights (sudo):"
@@ -261,6 +269,13 @@ choose_options() {
             MIRROR=0
         fi
     fi
+    if [ -z "$KNOB" ]; then
+        if ask_yn "Is the Lerdge knob module (rotary encoder) fitted to the screen?" "n"; then
+            KNOB=1
+        else
+            KNOB=0
+        fi
+    fi
     if [ -z "$BAUD" ]; then
         local def=250000
         [ "$MIRROR" = "1" ] && def=1500000
@@ -271,7 +286,7 @@ choose_options() {
         BAUD="$REPLY"
     fi
     case "$BAUD" in *[!0-9]*|"") die "Invalid baud rate '$BAUD'";; esac
-    info "Board: Lerdge-${BOARD^^}, baud: $BAUD, KlipperScreen mirror: $MIRROR"
+    info "Board: Lerdge-${BOARD^^}, baud: $BAUD, KlipperScreen mirror: $MIRROR, knob: $KNOB"
 }
 
 ######################################################################
@@ -532,6 +547,9 @@ configure_printer() {
     else
         info "Keeping the existing lerdge_tft.cfg"
     fi
+    if [ "$KNOB" = "1" ]; then
+        enable_knob "$cfg_dir/lerdge_tft.cfg"
+    fi
     python3 - "$PRINTER_CFG" "$BAUD" <<'EOF'
 import sys, re
 path, baud = sys.argv[1], sys.argv[2]
@@ -572,6 +590,33 @@ if not have_include:
 open(path, 'w', encoding='utf-8').write('\n'.join(out))
 EOF
     ok "printer.cfg: [include lerdge_tft.cfg], [mcu] baud: $BAUD"
+}
+
+# Enable the encoder_pins/click_pin lines of the knob module
+enable_knob() {
+    python3 - "$1" "$REPO_DIR/boards/lerdge-$BOARD.cfg" <<'EOF'
+import sys, re
+path, template = sys.argv[1], sys.argv[2]
+lines = open(path, encoding='utf-8').read().split('\n')
+if any(re.match(r'^(encoder_pins|click_pin)\s*:', l) for l in lines):
+    sys.exit(0)
+out = []
+found = False
+for l in lines:
+    m = re.match(r'^#((encoder_pins|click_pin)\s*:.*)$', l)
+    if m:
+        l = m.group(1)
+        found = True
+    out.append(l)
+if not found:
+    tmpl = [l[1:] for l in open(template, encoding='utf-8').read().split('\n')
+            if re.match(r'^#(encoder_pins|click_pin)\s*:', l)]
+    while out and not out[-1].strip():
+        out.pop()
+    out += tmpl + ['']
+open(path, 'w', encoding='utf-8').write('\n'.join(out))
+EOF
+    ok "Knob module enabled in lerdge_tft.cfg"
 }
 
 add_update_manager() {
@@ -634,6 +679,11 @@ install_mirror() {
     if [ ! -f "$cfg" ]; then
         cp "$REPO_DIR/klipperscreen/KlipperScreen-lerdge.conf" "$cfg"
         ok "Created KlipperScreen-lerdge.conf"
+    fi
+    if [ "$KNOB" = "1" ] && ! grep -q '^keyboard_navigation' "$cfg"; then
+        # The knob moves the keyboard focus in KlipperScreen
+        sed -i 's/^\[main\]$/[main]\nkeyboard_navigation: True/' "$cfg"
+        ok "Enabled keyboard navigation in KlipperScreen-lerdge.conf"
     fi
     mkdir -p "$DATA_DIR/logs"
     local unit

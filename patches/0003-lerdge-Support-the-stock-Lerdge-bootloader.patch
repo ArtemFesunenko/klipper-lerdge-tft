@@ -1,6 +1,6 @@
-From 48b12dfc97fafbd8aab4ddf0a95d563e08f28048 Mon Sep 17 00:00:00 2001
+From 08cb5c3bbb87bfffc8315b693b2cfa8f99f0e482 Mon Sep 17 00:00:00 2001
 From: Artem Fesunenko <body051@gmail.com>
-Date: Sat, 3 Oct 2026 08:19:38 +0300
+Date: Sat, 3 Oct 2026 15:40:04 +0300
 Subject: [PATCH 3/5] lerdge: Support the stock Lerdge bootloader
 
 Add STM32_LERDGE_RAM_RESERVE to keep the end of RAM free for the Lerdge

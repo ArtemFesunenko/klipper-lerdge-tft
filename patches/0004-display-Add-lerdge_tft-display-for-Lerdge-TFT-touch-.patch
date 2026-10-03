@@ -1,6 +1,6 @@
-From a39b5183922ef9dc3c58b4dfaad9788959d559fa Mon Sep 17 00:00:00 2001
+From c05b9d139fca5de3a0fa9df8b11af4b50a43fc60 Mon Sep 17 00:00:00 2001
 From: Artem Fesunenko <body051@gmail.com>
-Date: Sat, 3 Oct 2026 08:19:38 +0300
+Date: Sat, 3 Oct 2026 15:40:05 +0300
 Subject: [PATCH 4/5] display: Add lerdge_tft display for Lerdge TFT touch
  screens
 
@@ -8,26 +8,28 @@ Render the Klipper display and menu on the FSMC TFT of Lerdge boards as
 a 16x6 character screen with touch buttons, with touch calibration
 (TOUCH_CALIBRATE) and a mirror mode API that lets an external program
 (such as a KlipperScreen instance on a virtual X display) draw on the
-screen and receive touch events.
+screen and receive touch and knob (encoder) events.  The menu lets the
+display intercept key events for this.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- config/sample-lerdge-tft.cfg        |   63 ++
+ config/sample-lerdge-tft.cfg        |   73 ++
  docs/Lerdge_TFT.md                  |  173 +++++
  klippy/extras/display/display.cfg   |   68 ++
  klippy/extras/display/display.py    |    6 +-
- klippy/extras/display/lerdge_tft.py | 1050 +++++++++++++++++++++++++++
- 5 files changed, 1359 insertions(+), 1 deletion(-)
+ klippy/extras/display/lerdge_tft.py | 1067 +++++++++++++++++++++++++++
+ klippy/extras/display/menu.py       |    6 +
+ 6 files changed, 1392 insertions(+), 1 deletion(-)
  create mode 100644 config/sample-lerdge-tft.cfg
  create mode 100644 docs/Lerdge_TFT.md
  create mode 100644 klippy/extras/display/lerdge_tft.py
 
 diff --git a/config/sample-lerdge-tft.cfg b/config/sample-lerdge-tft.cfg
 new file mode 100644
-index 000000000..d30d4f6ec
+index 000000000..e883582dd
 --- /dev/null
 +++ b/config/sample-lerdge-tft.cfg
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,73 @@
 +# Lerdge TFT touch screen (ST7796S / ILI9488 on the FSMC bus)
 +#
 +# Requires the micro-controller code to be compiled with
@@ -70,6 +72,16 @@ index 000000000..d30d4f6ec
 +#   Turn the backlight off after this many seconds without touch (0 =
 +#   never). The first touch only wakes the screen.
 +#backlight_timeout: 0
++#   Knob module (rotary encoder with push button) that can be fitted to
++#   the Lerdge touch screen.  Lerdge-K: PG11, PG10 and PG9; Lerdge-X: PE4,
++#   PE3 and PE2.  Swap the two encoder pins if the direction is wrong.  In
++#   KlipperScreen mode the knob moves the keyboard focus (enable
++#   keyboard_navigation in the KlipperScreen configuration), a click
++#   presses the focused button and a long click returns to the main
++#   screen.
++#encoder_pins: ^PG11, ^PG10
++#click_pin: ^!PG9
++#encoder_steps_per_detent: 4
 +#   Short click on every touch (Lerdge-K beeper)
 +#beeper_pin: PC7
 +#beep_duration: 0.015
@@ -382,10 +394,10 @@ index cc33bc154..f667ced89 100644
          if self.show_data_group is None:
 diff --git a/klippy/extras/display/lerdge_tft.py b/klippy/extras/display/lerdge_tft.py
 new file mode 100644
-index 000000000..e8dbad589
+index 000000000..32b3fff29
 --- /dev/null
 +++ b/klippy/extras/display/lerdge_tft.py
-@@ -0,0 +1,1050 @@
+@@ -0,0 +1,1067 @@
 +# Support for parallel (FSMC) TFT touch screens found on Lerdge boards
 +#
 +# The screen is driven by the "tft_fsmc" micro-controller code, the touch
@@ -1241,6 +1253,21 @@ index 000000000..e8dbad589
 +            menu.timer = 0
 +            self.display.request_redraw()
 +
++    # Encoder / button events from the menu (knob module)
++    def menu_key_hook(self, key, eventtime):
++        self.last_activity = eventtime
++        if not self.backlight_on:
++            # The first action only wakes the screen
++            self._set_backlight(True)
++            self.reactor.update_timer(self.backlight_timer, self.reactor.NOW)
++            return True
++        if self.mode == 'calibrate':
++            return True
++        if self.mirror_active:
++            self._send_event({'action': 'key', 'key': key})
++            return True
++        return False
++
 +    # Mirror mode (screen content rendered by an external program)
 +    def _screen_point(self, rx, ry):
 +        x, y = self._native_to_screen(*self._raw_to_native(rx, ry))
@@ -1251,6 +1278,8 @@ index 000000000..e8dbad589
 +        msg = {'action': action}
 +        if rx is not None:
 +            msg['x'], msg['y'] = self._screen_point(rx, ry)
++        self._send_event(msg)
++    def _send_event(self, msg):
 +        clients = []
 +        for cconn, template in self.touch_clients:
 +            if cconn.is_closed():
@@ -1436,6 +1465,23 @@ index 000000000..e8dbad589
 +            self._draw_calibration()
 +        else:
 +            self.full_redraw()
+diff --git a/klippy/extras/display/menu.py b/klippy/extras/display/menu.py
+index e7723a7e3..c071302a2 100644
+--- a/klippy/extras/display/menu.py
++++ b/klippy/extras/display/menu.py
+@@ -1026,6 +1026,12 @@ class MenuManager:
+             self.begin(eventtime)
+ 
+     def key_event(self, key, eventtime):
++        # Allow the display to handle keys itself (for example a display
++        # that currently shows another program)
++        hook = getattr(getattr(self.display, 'lcd_chip', None),
++                       'menu_key_hook', None)
++        if hook is not None and hook(key, eventtime):
++            return
+         if key == 'click':
+             self._click_callback(eventtime, key)
+         elif key == 'long_click':
 -- 
 2.45.2.windows.1
 
