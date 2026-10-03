@@ -36,6 +36,7 @@ it, or the built-in Klipper menu. Everything installs with one script.
 - [Uninstalling](#uninstalling)
 - [Troubleshooting](#troubleshooting)
 - [Technical details](#technical-details)
+- [Development](#development)
 - [Credits and license](#credits-and-license)
 
 ## Features
