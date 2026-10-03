@@ -94,6 +94,10 @@ Lerdge boards is a USB-serial chip on the same USART1, so the firmware,
 the baud rate and everything else are identical – only the port name in
 `printer.cfg` differs (`/dev/serial/by-id/usb-...` or `/dev/ttyUSB0`
 for USB, for example `/dev/ttyS3` for the UART of an Orange Pi).
+Switching between them needs no new firmware. Use only one of them at a
+time (both drive the same RX pin), and do not pick "USB (on PA11/PA12)" in
+`make menuconfig`: on Lerdge boards those pins go to the USB flash drive
+port, not to the port for the host.
 
 ## How it works
 
