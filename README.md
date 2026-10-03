@@ -346,8 +346,11 @@ Measured on a Lerdge-K at 1500000 baud (link capacity about 150 KB/s):
 | Switching KlipperScreen panels continuously | 6.2–6.6 KB/s | 4.4% |
 | For comparison: one hour print (no display) | 0.8 KB/s median, 5.4 KB/s peak | 3.6% peak |
 
-The MCU was busy 1–2% of the time in every case (the difference is within
-the measurement noise) and not a single byte had to be retransmitted. If you want the absolute
+In these cases the MCU was busy 1–2% of the time (the difference is
+within the measurement noise). While someone quickly switches panels by
+touch it peaks at about 11% for a few seconds: redrawing the whole screen
+is about 150,000 pixels or 15 ms of MCU work, split into pieces of at most
+0.1 ms. Not a single byte had to be retransmitted. If you want the absolute
 minimum of extra load, use the built-in Klipper menu mode
 (`./install.sh --no-mirror`): it only redraws the text that changes.
 
