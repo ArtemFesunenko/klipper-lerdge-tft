@@ -35,6 +35,7 @@ it, or the built-in Klipper menu. Everything installs with one script.
 - [Configuration](#configuration)
 - [Updating](#updating)
 - [Serial baud rate](#serial-baud-rate)
+- [Load on the printer board](#load-on-the-printer-board)
 - [Uninstalling](#uninstalling)
 - [Troubleshooting](#troubleshooting)
 - [Technical details](#technical-details)
@@ -313,6 +314,42 @@ can not connect at 1500000 (long or poor wiring), set `baud: 250000` in
 the `[mcu]` section of `printer.cfg` and restart Klipper – the board will
 connect at 250000. To use 250000 permanently, run
 `./install.sh --update --baud 250000`.
+
+## Load on the printer board
+
+The screen shares the board's microcontroller and its serial link with
+the printing, so the display is designed to always yield to Klipper:
+
+- **Steps are not affected directly.** Klipper generates the step pulses
+  in timer interrupts from step data that is queued ahead; the display
+  commands run in the MCU's normal task loop.
+- **Short commands.** Every display command writes at most 1024 pixels
+  (about 0.1 ms) and a touch read runs one conversion (about 65 µs) at a
+  time, within the limits Klipper's
+  [code overview](https://www.klipper3d.org/Code_Overview.html) gives for
+  MCU tasks.
+- **Background priority.** Display messages are sent with the same
+  background priority as Klipper's own displays, so any step data that is
+  due soon goes first, and the mirror pauses while the serial queue is
+  busy.
+- **Only changes are sent.** The mirror sends the changed 16×16 tiles of
+  the picture, RLE compressed; a static picture costs nothing. While
+  printing, it updates at most twice per second and uses at most 20% of a
+  UART link (`--print-share` of `lerdge_mirror.py`).
+
+Measured on a Lerdge-K at 1500000 baud (link capacity about 150 KB/s):
+
+| Situation | MCU link traffic | Share of the link |
+| --- | --- | --- |
+| No display traffic | 0.2–0.3 KB/s | 0.2% |
+| KlipperScreen main screen (live temperature graph) | 3.3–3.8 KB/s | 2.5% |
+| Switching KlipperScreen panels continuously | 6.2–6.6 KB/s | 4.4% |
+| For comparison: one hour print (no display) | 0.8 KB/s median, 5.4 KB/s peak | 3.6% peak |
+
+The MCU was busy 1–2% of the time in every case (the difference is within
+the measurement noise) and not a single byte had to be retransmitted. If you want the absolute
+minimum of extra load, use the built-in Klipper menu mode
+(`./install.sh --no-mirror`): it only redraws the text that changes.
 
 ## Uninstalling
 

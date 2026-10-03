@@ -1,6 +1,6 @@
-From c05b9d139fca5de3a0fa9df8b11af4b50a43fc60 Mon Sep 17 00:00:00 2001
+From 8b438349b6bd3d9b5a2f4cf4a7b7481b1062c68f Mon Sep 17 00:00:00 2001
 From: Artem Fesunenko <body051@gmail.com>
-Date: Sat, 3 Oct 2026 15:40:05 +0300
+Date: Sat, 3 Oct 2026 16:06:58 +0300
 Subject: [PATCH 4/5] display: Add lerdge_tft display for Lerdge TFT touch
  screens
 
@@ -17,9 +17,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  docs/Lerdge_TFT.md                  |  173 +++++
  klippy/extras/display/display.cfg   |   68 ++
  klippy/extras/display/display.py    |    6 +-
- klippy/extras/display/lerdge_tft.py | 1067 +++++++++++++++++++++++++++
+ klippy/extras/display/lerdge_tft.py | 1094 +++++++++++++++++++++++++++
  klippy/extras/display/menu.py       |    6 +
- 6 files changed, 1392 insertions(+), 1 deletion(-)
+ 6 files changed, 1419 insertions(+), 1 deletion(-)
  create mode 100644 config/sample-lerdge-tft.cfg
  create mode 100644 docs/Lerdge_TFT.md
  create mode 100644 klippy/extras/display/lerdge_tft.py
@@ -394,10 +394,10 @@ index cc33bc154..f667ced89 100644
          if self.show_data_group is None:
 diff --git a/klippy/extras/display/lerdge_tft.py b/klippy/extras/display/lerdge_tft.py
 new file mode 100644
-index 000000000..32b3fff29
+index 000000000..1c4bb5b73
 --- /dev/null
 +++ b/klippy/extras/display/lerdge_tft.py
-@@ -0,0 +1,1067 @@
+@@ -0,0 +1,1094 @@
 +# Support for parallel (FSMC) TFT touch screens found on Lerdge boards
 +#
 +# The screen is driven by the "tft_fsmc" micro-controller code, the touch
@@ -439,7 +439,20 @@ index 000000000..32b3fff29
 +
 +# Largest bitmap payload per MCU message
 +MAX_BITMAP_BYTES = 32
-+MAX_FILL_PIXELS = 8192
++# Pixels written by one MCU command.  A pixel takes about 0.1us on the
++# STM32F407 FSMC, so a command keeps the MCU busy for at most ~100us (see
++# the "task" guidelines in Code_Overview.md).
++MAX_CMD_PIXELS = 1024
++
++# Number of pixels in a tft_fsmc_rle payload
++def rle_pixels(data):
++    pixels = i = 0
++    while i < len(data):
++        hdr = data[i]
++        count = (hdr & 0x7f) + 1
++        pixels += count
++        i += 3 if hdr & 0x80 else 1 + 2 * count
++    return pixels
 +
 +
 +######################################################################
@@ -822,7 +835,7 @@ index 000000000..32b3fff29
 +    def fill_rect(self, x, y, w, h, color):
 +        if w <= 0 or h <= 0:
 +            return
-+        rows = max(1, MAX_FILL_PIXELS // w)
++        rows = max(1, MAX_CMD_PIXELS // w)
 +        while h > 0:
 +            count = min(rows, h)
 +            self.fill_cmd.send([self.oid, x, y, w, count, color],
@@ -832,7 +845,8 @@ index 000000000..32b3fff29
 +    def draw_bitmap(self, x, y, width, rows, scale, fg, bg):
 +        # rows is a list of bytearrays of (width+7)//8 bytes
 +        row_bytes = (width + 7) // 8
-+        per_msg = max(1, MAX_BITMAP_BYTES // row_bytes)
++        per_msg = max(1, min(MAX_BITMAP_BYTES // row_bytes,
++                             MAX_CMD_PIXELS // (width * scale * scale)))
 +        for i in range(0, len(rows), per_msg):
 +            chunk = rows[i:i+per_msg]
 +            data = bytearray()
@@ -846,7 +860,8 @@ index 000000000..32b3fff29
 +        rows = [bytearray([font8x14.VGA_FONT[c][r] for c in text])
 +                for r in range(16)]
 +        # Split long strings so each message stays small
-+        max_chars = MAX_BITMAP_BYTES
++        max_chars = max(1, min(MAX_BITMAP_BYTES,
++                               MAX_CMD_PIXELS // (8 * scale * scale)))
 +        for i in range(0, len(text), max_chars):
 +            part = [r[i:i+max_chars] for r in rows]
 +            self.draw_bitmap(x + i * 8 * scale, y, len(part[0]) * 8, part,
@@ -1289,6 +1304,16 @@ index 000000000..32b3fff29
 +            tmp['params'] = msg
 +            cconn.send(tmp)
 +        self.touch_clients = clients
++    def _link_rate(self):
++        # Throughput of a UART link to the MCU in bytes/s (None for USB
++        # and CAN, those are much faster)
++        try:
++            port, baud = self.mcu._conn_helper.get_serialport()
++        except Exception:
++            return None
++        if not baud or 'usb' in port.lower():
++            return None
++        return baud // 10
 +    def _pending_bytes(self):
 +        stats = self.mcu._serial.stats(self.reactor.monotonic())
 +        total = 0
@@ -1357,7 +1382,8 @@ index 000000000..32b3fff29
 +                                     reqclock=BACKGROUND_PRIORITY_CLOCK)
 +                for chunk in rect['chunks']:
 +                    data = bytearray(base64.b64decode(chunk))
-+                    if len(data) > MAX_RLE_BYTES:
++                    if (len(data) > MAX_RLE_BYTES
++                        or rle_pixels(data) > MAX_CMD_PIXELS):
 +                        raise web_request.error("Chunk too large")
 +                    self.rle_cmd.send([self.oid, data],
 +                                      reqclock=BACKGROUND_PRIORITY_CLOCK)
@@ -1366,7 +1392,8 @@ index 000000000..32b3fff29
 +        web_request.send({'pending_bytes': self._pending_bytes(),
 +                          'need_full': need_full,
 +                          'width': self.width, 'height': self.height,
-+                          'printing': self._is_printing()})
++                          'printing': self._is_printing(),
++                          'link_rate': self._link_rate()})
 +    def _handle_subscribe_touch(self, web_request):
 +        if not self.touch_enabled:
 +            raise web_request.error("Touch panel not configured")

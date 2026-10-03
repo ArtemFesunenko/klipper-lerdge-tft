@@ -1,6 +1,6 @@
-From 14de2868e427179f322ade79b4c9c3f649685e7a Mon Sep 17 00:00:00 2001
+From b7334572a5651c9f2d90bcafd11fab1764e0de1d Mon Sep 17 00:00:00 2001
 From: Artem Fesunenko <body051@gmail.com>
-Date: Sat, 3 Oct 2026 15:40:05 +0300
+Date: Sat, 3 Oct 2026 16:06:58 +0300
 Subject: [PATCH 5/5] scripts: Add lerdge_mirror.py to show KlipperScreen on
  Lerdge TFTs
 
@@ -8,19 +8,21 @@ Mirror an Xvfb display to the lerdge_tft module: changed regions are
 RLE encoded and sent through the Klipper API socket, and touch gestures
 are injected into X as clicks, mouse wheel scrolling and holds.  Knob
 (encoder) events become keyboard navigation (Tab, Return, Escape).
+While printing, the display traffic is kept below a share of the MCU
+link bandwidth.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- scripts/lerdge_mirror.py | 436 +++++++++++++++++++++++++++++++++++++++
- 1 file changed, 436 insertions(+)
+ scripts/lerdge_mirror.py | 468 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 468 insertions(+)
  create mode 100644 scripts/lerdge_mirror.py
 
 diff --git a/scripts/lerdge_mirror.py b/scripts/lerdge_mirror.py
 new file mode 100644
-index 000000000..1e6114382
+index 000000000..051510461
 --- /dev/null
 +++ b/scripts/lerdge_mirror.py
-@@ -0,0 +1,436 @@
+@@ -0,0 +1,468 @@
 +#!/usr/bin/env python3
 +# Mirror an X display (for example KlipperScreen on Xvfb) to a Lerdge TFT
 +#
@@ -42,11 +44,16 @@ index 000000000..1e6114382
 +MAX_CHUNK = 48
 +MAX_LITERAL = (MAX_CHUNK - 1) // 2
 +MAX_REPEAT = 128
++# Pixels per MCU command (about 0.1us each), keeps every command short
++MAX_CHUNK_PIXELS = 1024
 +MAX_BYTES_PER_REQUEST = 3000
 +PENDING_LIMIT = 1500
 +POLL_TIME = 0.10
 +PRINTING_POLL_TIME = 0.50
 +KEEPALIVE_TIME = 5.
++# While printing, the display may use this share of a UART link to the MCU
++PRINT_LINK_SHARE = 0.20
++MAX_THROTTLE_WAIT = 10.
 +
 +######################################################################
 +# Klipper API socket client
@@ -241,14 +248,21 @@ index 000000000..1e6114382
 +        flush_literal(lit_start, lit_len)
 +    return tokens
 +
++def token_pixels(t):
++    return (t[0] & 0x7f) + 1
++
 +def pack_chunks(tokens):
 +    chunks = []
 +    cur = b""
++    pixels = 0
 +    for t in tokens:
-+        if len(cur) + len(t) > MAX_CHUNK:
++        tp = token_pixels(t)
++        if len(cur) + len(t) > MAX_CHUNK or pixels + tp > MAX_CHUNK_PIXELS:
 +            chunks.append(cur)
 +            cur = b""
++            pixels = 0
 +        cur += t
++        pixels += tp
 +    if cur:
 +        chunks.append(cur)
 +    return chunks
@@ -356,6 +370,8 @@ index 000000000..1e6114382
 +        self.args = args
 +        self.prev = None
 +        self.printing = False
++        self.link_rate = None
++        self.link_free = 0.
 +        self.injector = None
 +    def touch(self, params):
 +        if self.injector is not None:
@@ -372,16 +388,31 @@ index 000000000..1e6114382
 +            if full and idx == len(rects) - 1:
 +                rect['full'] = True
 +            batch.append(rect)
-+            size += sum(len(c) + 8 for c in chunks)
++            size += 12 + sum(len(c) + 8 for c in chunks)
 +            if size >= MAX_BYTES_PER_REQUEST:
-+                result = self.draw(client, batch)
++                result = self.draw(client, batch, size)
 +                batch, size = [], 0
 +        if batch or result is None:
-+            result = self.draw(client, batch)
++            result = self.draw(client, batch, size)
 +        return result
-+    def draw(self, client, rects):
++    def throttle(self, size):
++        # While printing, keep the display below a share of the MCU link
++        # bandwidth (the display messages are already sent with background
++        # priority, this also bounds their total volume)
++        if not size or not self.printing or not self.link_rate:
++            return
++        budget = self.link_rate * self.args.print_share
++        now = time.time()
++        wait = self.link_free - now
++        if wait > 0:
++            time.sleep(min(wait, MAX_THROTTLE_WAIT))
++            now = time.time()
++        self.link_free = max(now, self.link_free) + size / budget
++    def draw(self, client, rects, size=0):
++        self.throttle(size)
 +        res = client.request("lerdge_tft/draw", {'rects': rects})
 +        self.printing = res.get('printing', False)
++        self.link_rate = res.get('link_rate')
 +        # Simple flow control - wait for the serial queue to drain
 +        while res.get('pending_bytes', 0) > PENDING_LIMIT:
 +            time.sleep(0.02)
@@ -450,6 +481,9 @@ index 000000000..1e6114382
 +                       "~/printer_data/comms/klippy.sock"))
 +    p.add_argument("-d", "--display", default=":99")
 +    p.add_argument("-x", "--xwd", default="/dev/shm/lerdge/Xvfb_screen0")
++    p.add_argument("--print-share", type=float, default=PRINT_LINK_SHARE,
++                   help="share of a UART link to the MCU that the display"
++                   " may use while printing (default %(default)s)")
 +    args = p.parse_args()
 +    logging.basicConfig(level=logging.INFO,
 +                        format="%(asctime)s %(message)s")

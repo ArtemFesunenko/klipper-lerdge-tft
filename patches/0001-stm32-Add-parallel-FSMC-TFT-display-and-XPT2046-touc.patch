@@ -1,6 +1,6 @@
-From dba5e3cae0b3078fb43b50e7fdc891b78204f10b Mon Sep 17 00:00:00 2001
+From a41caa3ca95ca20c19a49c880d43ffa767ca9685 Mon Sep 17 00:00:00 2001
 From: Artem Fesunenko <body051@gmail.com>
-Date: Sat, 3 Oct 2026 15:40:04 +0300
+Date: Sat, 3 Oct 2026 16:06:56 +0300
 Subject: [PATCH 1/5] stm32: Add parallel (FSMC) TFT display and XPT2046 touch
  support
 
@@ -8,8 +8,10 @@ Add a "tft_fsmc" module for STM32F4 that drives MIPI DCS compatible
 displays on the FSMC bus with simple drawing primitives: controller
 commands, solid fills, scaled monochrome bitmaps and an RLE encoded
 pixel stream.  Also add a software SPI reader for XPT2046 resistive
-touch controllers.  The drawing and touch commands are allowed after a
-shutdown so a host can keep showing (and using) the screen.
+touch controllers.  A touch read is done one conversion per task run so
+it never blocks other work for long.  The drawing and touch commands are
+allowed after a shutdown so a host can keep showing (and using) the
+screen.
 
 Used for the touch screens of Lerdge boards.
 
@@ -17,8 +19,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  src/Kconfig          |   7 +
  src/stm32/Makefile   |   1 +
- src/stm32/tft_fsmc.c | 342 +++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 350 insertions(+)
+ src/stm32/tft_fsmc.c | 386 +++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 394 insertions(+)
  create mode 100644 src/stm32/tft_fsmc.c
 
 diff --git a/src/Kconfig b/src/Kconfig
@@ -60,10 +62,10 @@ index 3c158d518..806d9568d 100644
  i2c-src-$(CONFIG_MACH_STM32F2) := stm32/i2c.c
 diff --git a/src/stm32/tft_fsmc.c b/src/stm32/tft_fsmc.c
 new file mode 100644
-index 000000000..441f72a70
+index 000000000..a6675b872
 --- /dev/null
 +++ b/src/stm32/tft_fsmc.c
-@@ -0,0 +1,342 @@
+@@ -0,0 +1,386 @@
 +// Parallel (FSMC) TFT display support for STM32F4 boards (Lerdge, etc.)
 +//
 +// The host sends low level drawing primitives (controller commands, solid
@@ -321,12 +323,18 @@ index 000000000..441f72a70
 + ****************************************************************/
 +
 +#define TOUCH_SAMPLES 5
++// A read is pressure z1 and z2 followed by the X and the Y samples
++#define TOUCH_STEPS (2 + 2 * TOUCH_SAMPLES)
 +
 +struct tft_touch {
 +    struct gpio_out cs, sclk, mosi;
 +    struct gpio_in miso;
 +    uint32_t half_ticks;
++    uint8_t step;
++    uint16_t z1, z2, x[TOUCH_SAMPLES], y[TOUCH_SAMPLES];
 +};
++
++static struct task_wake touch_wake;
 +
 +static void
 +touch_delay(struct tft_touch *tt)
@@ -361,17 +369,43 @@ index 000000000..441f72a70
 +}
 +
 +static uint16_t
-+touch_median(struct tft_touch *tt, uint8_t cmd)
++touch_median(uint16_t *v)
 +{
-+    uint16_t v[TOUCH_SAMPLES];
 +    int i, j;
-+    for (i = 0; i < TOUCH_SAMPLES; i++) {
-+        uint16_t s = touch_convert(tt, cmd);
++    for (i = 1; i < TOUCH_SAMPLES; i++) {
++        uint16_t s = v[i];
 +        for (j = i; j > 0 && v[j - 1] > s; j--)
 +            v[j] = v[j - 1];
 +        v[j] = s;
 +    }
 +    return v[TOUCH_SAMPLES / 2];
++}
++
++// Run one conversion of a touch read.  A full read takes about 0.8ms, so
++// it is split into one conversion (about 65us) per task run to not delay
++// the processing of other commands.
++static void
++touch_step(uint8_t oid, struct tft_touch *tt)
++{
++    uint8_t step = tt->step - 1;
++    if (step == 0)
++        tt->z1 = touch_convert(tt, 0xb0);
++    else if (step == 1)
++        tt->z2 = touch_convert(tt, 0xc0);
++    else if (step < 2 + TOUCH_SAMPLES)
++        tt->x[step - 2] = touch_convert(tt, 0xd0);
++    else
++        // Power-down mode 0 keeps PENIRQ enabled after the read
++        tt->y[step - 2 - TOUCH_SAMPLES] = touch_convert(tt, 0x90);
++    if (tt->step++ < TOUCH_STEPS) {
++        sched_wake_task(&touch_wake);
++        return;
++    }
++    tt->step = 0;
++    gpio_out_write(tt->cs, 1);
++    sendf("tft_touch_result oid=%c z=%hu x=%hu y=%hu"
++          , oid, tt->z1 + 4095 - tt->z2, touch_median(tt->x)
++          , touch_median(tt->y));
 +}
 +
 +void
@@ -395,17 +429,29 @@ index 000000000..441f72a70
 +{
 +    uint8_t oid = args[0];
 +    struct tft_touch *tt = oid_lookup(oid, command_config_tft_touch);
++    if (tt->step)
++        // A read is already in progress (retransmitted query)
++        return;
 +    gpio_out_write(tt->cs, 0);
-+    uint16_t z1 = touch_convert(tt, 0xb0), z2 = touch_convert(tt, 0xc0);
-+    uint16_t x = touch_median(tt, 0xd0);
-+    // The last conversion uses power-down mode 0 so PENIRQ stays enabled
-+    uint16_t y = touch_median(tt, 0x90);
-+    gpio_out_write(tt->cs, 1);
-+    sendf("tft_touch_result oid=%c z=%hu x=%hu y=%hu"
-+          , oid, z1 + 4095 - z2, x, y);
++    tt->step = 1;
++    sched_wake_task(&touch_wake);
 +}
 +DECL_COMMAND_FLAGS(command_tft_touch_read, HF_IN_SHUTDOWN,
 +                   "tft_touch_read oid=%c");
++
++void
++tft_touch_task(void)
++{
++    if (!sched_check_wake(&touch_wake))
++        return;
++    uint8_t oid;
++    struct tft_touch *tt;
++    foreach_oid(oid, tt, command_config_tft_touch) {
++        if (tt->step)
++            touch_step(oid, tt);
++    }
++}
++DECL_TASK(tft_touch_task);
 -- 
 2.45.2.windows.1
 
