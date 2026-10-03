@@ -231,6 +231,13 @@ check_environment() {
     fi
     info "Klipper:     $KLIPPER_DIR ($(klipper_version))"
     info "Config:      $PRINTER_CFG"
+    if [ "$DO_SERVICES" = "1" ] || [ "$MODE" != "finish" ]; then
+        # Ask for the sudo password once, before anything is changed
+        if ! sudo -n true 2>/dev/null; then
+            info "Some steps need administrator rights (sudo):"
+            sudo -v || die "sudo is required (run the installer from a terminal)"
+        fi
+    fi
 }
 
 choose_options() {
@@ -433,7 +440,8 @@ flash_sd() {
     dev="$(serial_device)"
     [ -n "$dev" ] || die "Unknown MCU serial port (use --serial)"
     log=/tmp/lerdge-flash.log
-    sysctl stop "$KLIPPER_SERVICE"
+    sysctl stop "$KLIPPER_SERVICE" \
+        || die "Could not stop the $KLIPPER_SERVICE service"
     set +e
     (cd "$KLIPPER_DIR" && ./scripts/flash-sdcard.sh $mode -b "$baud" \
         "$dev" "lerdge-$BOARD") >"$log" 2>&1
