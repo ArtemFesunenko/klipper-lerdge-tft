@@ -1,0 +1,374 @@
+From 5ffdff5559efa1980ac9576ea0b016ad3c9e4d6e Mon Sep 17 00:00:00 2001
+From: Artem Fesunenko <body051@gmail.com>
+Date: Sat, 3 Oct 2026 07:56:48 +0300
+Subject: [PATCH 3/5] lerdge: Support the stock Lerdge bootloader
+
+Add STM32_LERDGE_RAM_RESERVE to keep the end of RAM free for the Lerdge
+bootloader, scripts/update_lerdge.py to create the encrypted firmware
+files it installs from the TF card, and "lerdge-k"/"lerdge-x" board
+definitions for flash-sdcard.sh (SDIO, creating the directories the
+bootloader expects and removing the file after a verified update).
+
+scripts/lerdge_bootflag.py inspects and clears the bootloader's
+"no update" flag in the board's SPI flash.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/lerdge_bootflag.py      | 136 ++++++++++++++++++++++++++++++++
+ scripts/spi_flash/board_defs.py |  26 ++++++
+ scripts/spi_flash/fatfs_api.c   |   9 +++
+ scripts/spi_flash/fatfs_api.h   |   1 +
+ scripts/spi_flash/fatfs_lib.py  |   1 +
+ scripts/spi_flash/spi_flash.py  |  14 ++++
+ scripts/update_lerdge.py        |  55 +++++++++++++
+ src/stm32/Kconfig               |   9 +++
+ 8 files changed, 251 insertions(+)
+ create mode 100644 scripts/lerdge_bootflag.py
+ create mode 100644 scripts/update_lerdge.py
+
+diff --git a/scripts/lerdge_bootflag.py b/scripts/lerdge_bootflag.py
+new file mode 100644
+index 000000000..cdf939ff4
+--- /dev/null
++++ b/scripts/lerdge_bootflag.py
+@@ -0,0 +1,136 @@
++#!/usr/bin/env python3
++# Request a firmware update from the stock Lerdge-K bootloader
++#
++# The Lerdge-K bootloader (V1.0.4) keeps a flag byte at offset 0x500000 of
++# the board's external SPI flash (SPI1 on PA5/PA6/PA7, CS on PC4).  When the
++# byte is 0xAA the bootloader starts the application without looking for a
++# firmware update on the TF card.  This tool clears the byte (a NOR flash
++# program operation that only clears bits, so no erase is needed) and
++# resets the micro-controller so that the bootloader installs
++# "Lerdge_K_system/Firmware/Lerdge_K_firmware_force.bin" from the TF card.
++# The bootloader sets the flag back to 0xAA after checking for updates.
++#
++# Klipper must be stopped while this tool runs.
++#
++# Copyright (C) 2026  Klipper Lerdge TFT contributors
++#
++# This file may be distributed under the terms of the GNU GPLv3 license.
++import sys, os, argparse
++KLIPPER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
++sys.path.append(os.path.join(KLIPPER_DIR, "klippy"))
++import reactor, serialhdl
++
++FLAG_ADDR = 0x500000
++RECORD_SIZE = 0x21
++FLAG_OK = 0xAA
++
++class LerdgeBootFlag:
++    def __init__(self, args):
++        self.args = args
++        self.reactor = reactor.Reactor()
++        self.ser = None
++    def out(self, msg):
++        sys.stdout.write(msg + "\n")
++        sys.stdout.flush()
++    def connect(self):
++        if self.ser is not None:
++            self.ser.disconnect()
++        self.ser = serialhdl.SerialReader(self.reactor)
++        self.ser.connect_uart(self.args.device, self.args.baud)
++    def get_config(self):
++        return self.ser.send_with_response("get_config", "config")
++    def reset(self):
++        self.ser.send("reset")
++        self.reactor.pause(self.reactor.monotonic() + 0.015)
++    def xfer(self, data):
++        cmd = "spi_transfer oid=0 data=%s" % (
++            "".join(["%02x" % (b,) for b in data]),)
++        msg = self.ser.get_msgparser().create_command(cmd)
++        src = serialhdl.SerialRetryCommand(self.ser, "spi_transfer_response",
++                                           0)
++        params = src.get_response([msg],
++                                  self.ser.get_default_command_queue())
++        return bytearray(params['response'])
++    def setup_spi(self):
++        cfg = self.get_config()
++        if cfg['is_config'] or cfg['is_shutdown']:
++            raise Exception("MCU is already configured - stop Klipper and"
++                            " reset the MCU first")
++        self.ser.send("allocate_oids count=1")
++        self.ser.send("config_spi oid=0 pin=PC4 cs_active_high=0")
++        self.ser.send("spi_set_bus oid=0 spi_bus=spi1 mode=0 rate=1000000")
++        self.ser.send("finalize_config crc=0")
++        cfg = self.get_config()
++        if not cfg['is_config'] or cfg['is_shutdown']:
++            raise Exception("MCU configuration failed: %s" % (cfg,))
++    def read(self, addr, count):
++        resp = self.xfer([0x03, (addr >> 16) & 0xff, (addr >> 8) & 0xff,
++                          addr & 0xff] + [0] * count)
++        return resp[4:]
++    def wait_ready(self):
++        for i in range(100):
++            if not self.xfer([0x05, 0])[1] & 0x01:
++                return
++            self.reactor.pause(self.reactor.monotonic() + 0.005)
++        raise Exception("SPI flash busy timeout")
++    def run_task(self, eventtime):
++        try:
++            self.connect()
++            if self.get_config()['is_config']:
++                self.out("MCU is configured, resetting it first...")
++                self.reset()
++                self.reactor.pause(self.reactor.monotonic() + 3.)
++                self.connect()
++            self.setup_spi()
++            jedec = self.xfer([0x9f, 0, 0, 0])[1:]
++            self.out("SPI flash JEDEC id: %s" % (jedec.hex(),))
++            if jedec in (b'\x00\x00\x00', b'\xff\xff\xff'):
++                raise Exception("No SPI flash found")
++            record = self.read(FLAG_ADDR, RECORD_SIZE)
++            self.out("Record at 0x%x: %s" % (FLAG_ADDR, record.hex()))
++            if self.args.clear:
++                if record[0] != FLAG_OK:
++                    self.out("Flag is 0x%02x (not 0x%02x), leaving it"
++                             % (record[0], FLAG_OK))
++                else:
++                    self.xfer([0x06])
++                    self.xfer([0x02, (FLAG_ADDR >> 16) & 0xff,
++                               (FLAG_ADDR >> 8) & 0xff, FLAG_ADDR & 0xff,
++                               0x00])
++                    self.wait_ready()
++                    record = self.read(FLAG_ADDR, RECORD_SIZE)
++                    self.out("Record after clear: %s" % (record.hex(),))
++                    if record[0] != 0x00:
++                        raise Exception("Failed to clear the flag")
++                if self.args.reset:
++                    self.out("Resetting MCU into the bootloader...")
++                    self.reset()
++            self.result = 0
++        except Exception as e:
++            self.out("ERROR: %s" % (e,))
++            self.result = 1
++        self.reactor.end()
++    def run(self):
++        self.result = 1
++        self.reactor.register_callback(self.run_task)
++        try:
++            self.reactor.run()
++        finally:
++            if self.ser is not None:
++                self.ser.disconnect()
++            self.reactor.finalize()
++        return self.result
++
++def main():
++    p = argparse.ArgumentParser(description="Lerdge-K bootloader update flag")
++    p.add_argument("-b", "--baud", type=int, default=250000)
++    p.add_argument("--clear", action="store_true",
++                   help="clear the 'no update' flag (0xAA)")
++    p.add_argument("--reset", action="store_true",
++                   help="reset the MCU after clearing the flag")
++    p.add_argument("device")
++    args = p.parse_args()
++    sys.exit(LerdgeBootFlag(args).run())
++
++if __name__ == '__main__':
++    main()
+diff --git a/scripts/spi_flash/board_defs.py b/scripts/spi_flash/board_defs.py
+index 0a403d7da..c0643865c 100644
+--- a/scripts/spi_flash/board_defs.py
++++ b/scripts/spi_flash/board_defs.py
+@@ -88,6 +88,32 @@ BOARD_DEFS = {
+         'spi_pins': "PA6,PB5,PA5",
+         "cs_pin": "PA4"
+     },
++    # Lerdge K - the stock bootloader installs an encrypted image from
++    # this path and keeps it, so it is deleted after a successful flash.
++    # The bootloader accesses the card in SDIO mode, so SDIO must be used
++    # here too (a card switched to SPI mode needs a power cycle).
++    'lerdge-k': {
++        'mcu': "stm32f407xx",
++        'sdio_bus': "sdio",
++        "conversion_script": "scripts/update_lerdge.py",
++        "firmware_path": "Lerdge_K_system/Firmware/Lerdge_K_firmware_force.bin"
++    },
++    'lerdge-x': {
++        'mcu': "stm32f407xx",
++        'sdio_bus': "sdio",
++        "conversion_script": "scripts/update_lerdge.py",
++        "firmware_path": "Lerdge_X_system/Firmware/Lerdge_X_firmware_force.bin"
++    },
++    # Only needed when the card was left in SPI mode (requires a power
++    # cycle for the bootloader to read it)
++    'lerdge-k-spi': {
++        'mcu': "stm32f407xx",
++        'spi_bus': "swspi",
++        'spi_pins': "PC8,PD2,PC12",
++        'cs_pin': "PC11",
++        "conversion_script": "scripts/update_lerdge.py",
++        "firmware_path": "Lerdge_K_system/Firmware/Lerdge_K_firmware_force.bin"
++    },
+     'btt-gtr': {
+         'mcu': "stm32f407xx",
+         'spi_bus': "spi1",
+diff --git a/scripts/spi_flash/fatfs_api.c b/scripts/spi_flash/fatfs_api.c
+index c3d5db1c5..6165d2a75 100644
+--- a/scripts/spi_flash/fatfs_api.c
++++ b/scripts/spi_flash/fatfs_api.c
+@@ -182,6 +182,15 @@ fatfs_write(struct ff_file* fhdl, const void* wbuf, uint16_t btw)
+     return bytes_written;
+ }
+ 
++// Create a directory
++uint8_t __visible
++fatfs_mkdir(const char* path)
++{
++    FRESULT res;
++    res = f_mkdir(path);
++    return res;
++}
++
+ // Remove a file or director
+ uint8_t __visible
+ fatfs_remove(const char* path)
+diff --git a/scripts/spi_flash/fatfs_api.h b/scripts/spi_flash/fatfs_api.h
+index adbf75886..25c88774d 100644
+--- a/scripts/spi_flash/fatfs_api.h
++++ b/scripts/spi_flash/fatfs_api.h
+@@ -42,6 +42,7 @@ struct ff_file* fatfs_open(const char* path, uint8_t mode);
+ uint8_t fatfs_close(struct ff_file* fhdl);
+ int fatfs_read(struct ff_file* fhdl, void* rbuf, uint16_t btr);
+ int fatfs_write(struct ff_file* fhdl, const void* wbuf, uint16_t btw);
++uint8_t fatfs_mkdir(const char* path);
+ uint8_t fatfs_remove(const char* path);
+ uint8_t fatfs_get_fstats(struct ff_file_info* finfo, const char* path);
+ uint8_t fatfs_get_disk_info(struct ff_disk_info* dinfo);
+diff --git a/scripts/spi_flash/fatfs_lib.py b/scripts/spi_flash/fatfs_lib.py
+index ef92070ab..d7c95a48f 100644
+--- a/scripts/spi_flash/fatfs_lib.py
++++ b/scripts/spi_flash/fatfs_lib.py
+@@ -48,6 +48,7 @@ FATFS_CDEFS = """
+     uint8_t fatfs_close(struct ff_file* fhdl);
+     int fatfs_read(struct ff_file* fhdl, void* rbuf, uint16_t btr);
+     int fatfs_write(struct ff_file* fhdl, const void* wbuf, uint16_t btw);
++    uint8_t fatfs_mkdir(const char* path);
+     uint8_t fatfs_remove(const char* path);
+     uint8_t fatfs_get_fstats(struct ff_file_info* finfo, const char* path);
+     uint8_t fatfs_get_disk_info(struct ff_disk_info* dinfo);
+diff --git a/scripts/spi_flash/spi_flash.py b/scripts/spi_flash/spi_flash.py
+index 16d5077b1..28b2232c6 100644
+--- a/scripts/spi_flash/spi_flash.py
++++ b/scripts/spi_flash/spi_flash.py
+@@ -366,6 +366,18 @@ class FatFS:
+         sdf.open()
+         return sdf
+ 
++    def make_dirs(self, sd_dir_path):
++        # Create all components of a directory path (existing are ignored)
++        path = ""
++        for part in sd_dir_path.split('/'):
++            if not part:
++                continue
++            path = path + "/" + part if path else part
++            ret = self.ffi_lib.fatfs_mkdir(path.encode())
++            if ret not in (0, FRESULT.index("FR_EXIST")):
++                raise OSError("flash_sdcard: Error creating directory '%s',"
++                              " result: %s" % (path, FRESULT[ret]))
++
+     def remove_item(self, sd_path):
+         # Can be path to directory or file
+         ret = self.ffi_lib.fatfs_remove(sd_path.encode())
+@@ -1436,6 +1448,8 @@ class MCUConnection:
+             except Exception:
+                 logging.exception("Error cleaning old firmware files")
+         try:
++            if os.path.dirname(fw_path):
++                self.fatfs.make_dirs(os.path.dirname(fw_path))
+             with open(klipper_bin_path, 'rb') as local_f:
+                 with self.fatfs.open_file(fw_path, "wb") as sd_f:
+                     while True:
+diff --git a/scripts/update_lerdge.py b/scripts/update_lerdge.py
+new file mode 100644
+index 000000000..865d2c8ce
+--- /dev/null
++++ b/scripts/update_lerdge.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python3
++# Encrypt a Klipper binary for the stock Lerdge bootloader
++#
++# The Lerdge bootloader (64KiB, application at 0x08010000) installs
++# "Lerdge_X_system/Firmware/Lerdge_X_firmware_force.bin" from the root of
++# the TF card at power on.  The file is a byte-wise scrambled image.
++#
++# Copyright (C) 2026  Klipper Lerdge TFT contributors
++#
++# This file may be distributed under the terms of the GNU GPLv3 license.
++import sys, os, argparse
++
++def encrypt_byte(b):
++    b = 0xff & ((b << 6) | (b >> 2))
++    i = 0x58 + b
++    j = 0x05 + b + (i >> 8)
++    return (0xf8 & i) | (0x07 & j)
++
++ENCRYPT = bytearray([encrypt_byte(b) for b in range(256)])
++DECRYPT = bytearray(256)
++for _plain, _enc in enumerate(ENCRYPT):
++    DECRYPT[_enc] = _plain
++
++BOARDS = {'k': 'K', 'x': 'X', 's': 'S'}
++
++def main():
++    p = argparse.ArgumentParser(
++        description="Create a Lerdge bootloader firmware file")
++    p.add_argument("input", help="klipper.bin (built with 64KiB bootloader)")
++    p.add_argument("output", nargs="?", default=None,
++                   help="output file or directory (default: create"
++                   " Lerdge_<board>_system/Firmware/... in the current dir)")
++    p.add_argument("-b", "--board", default="k", choices=sorted(BOARDS),
++                   help="Lerdge board type (default: k)")
++    p.add_argument("-d", "--decrypt", action="store_true",
++                   help="decrypt instead of encrypt")
++    args = p.parse_args()
++    data = bytearray(open(args.input, 'rb').read())
++    table = DECRYPT if args.decrypt else ENCRYPT
++    out = bytearray(table[b] for b in data)
++    board = BOARDS[args.board]
++    output = args.output
++    if output is None or os.path.isdir(output):
++        base = output or "."
++        folder = os.path.join(base, "Lerdge_%s_system" % (board,), "Firmware")
++        if not os.path.isdir(folder):
++            os.makedirs(folder)
++        output = os.path.join(folder, "Lerdge_%s_firmware_force.bin"
++                              % (board,))
++    with open(output, 'wb') as f:
++        f.write(out)
++    sys.stdout.write("Wrote %d bytes to %s\n" % (len(out), output))
++
++if __name__ == '__main__':
++    main()
+diff --git a/src/stm32/Kconfig b/src/stm32/Kconfig
+index e9aa08791..f342ce2f9 100644
+--- a/src/stm32/Kconfig
++++ b/src/stm32/Kconfig
+@@ -252,6 +252,7 @@ config RAM_SIZE
+     default 0xa000 if MACH_STM32L412
+     default 0x20000 if MACH_STM32F207
+     default 0x10000 if MACH_STM32F401
++    default 0x1FFF0 if MACH_STM32F4x5 && STM32_LERDGE_RAM_RESERVE
+     default 0x20000 if MACH_STM32F4x5 || MACH_STM32F446
+     default 0x80000 if MACH_STM32F765
+     default 0x9000 if MACH_STM32G07x
+@@ -320,6 +321,14 @@ choice
+     config STM32_FLASH_START_0000
+         bool "No bootloader"
+ endchoice
++config STM32_LERDGE_RAM_RESERVE
++    bool "Keep the last 16 bytes of RAM free (Lerdge bootloader)"
++    depends on MACH_STM32F4x5 && STM32_FLASH_START_10000
++    default n
++    help
++        The stock Lerdge bootloader uses the end of RAM, so the Klipper
++        stack must not start at the very top of RAM on Lerdge boards.
++
+ config FLASH_APPLICATION_ADDRESS
+     hex
+     default 0x8000800 if STM32_FLASH_START_800
+-- 
+2.45.2.windows.1
+

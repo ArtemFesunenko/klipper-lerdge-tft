@@ -1,0 +1,17 @@
+[Unit]
+Description=KlipperScreen on the Lerdge TFT
+Requires=lerdge-xvfb.service
+After=lerdge-xvfb.service moonraker.service
+
+[Service]
+Type=simple
+User=@USER@
+Environment=DISPLAY=@DISPLAY@
+WorkingDirectory=@KS_DIR@
+ExecStartPre=/bin/sleep 2
+ExecStart=@KS_ENV@/bin/python @KS_DIR@/screen.py -c @DATA_DIR@/config/KlipperScreen-lerdge.conf -l @DATA_DIR@/logs/KlipperScreen-lerdge.log
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

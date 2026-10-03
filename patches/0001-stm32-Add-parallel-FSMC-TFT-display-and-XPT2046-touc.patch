@@ -1,0 +1,411 @@
+From 8ac3c4dc8d9500009fd648389bf9f41df85f214b Mon Sep 17 00:00:00 2001
+From: Artem Fesunenko <body051@gmail.com>
+Date: Sat, 3 Oct 2026 07:56:47 +0300
+Subject: [PATCH 1/5] stm32: Add parallel (FSMC) TFT display and XPT2046 touch
+ support
+
+Add a "tft_fsmc" module for STM32F4 that drives MIPI DCS compatible
+displays on the FSMC bus with simple drawing primitives: controller
+commands, solid fills, scaled monochrome bitmaps and an RLE encoded
+pixel stream.  Also add a software SPI reader for XPT2046 resistive
+touch controllers.  The drawing and touch commands are allowed after a
+shutdown so a host can keep showing (and using) the screen.
+
+Used for the touch screens of Lerdge boards.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/Kconfig          |   7 +
+ src/stm32/Makefile   |   1 +
+ src/stm32/tft_fsmc.c | 342 +++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 350 insertions(+)
+ create mode 100644 src/stm32/tft_fsmc.c
+
+diff --git a/src/Kconfig b/src/Kconfig
+index 7041ee074..8efed1dad 100644
+--- a/src/Kconfig
++++ b/src/Kconfig
+@@ -136,6 +136,10 @@ config WANT_HD44780
+     bool
+     depends on HAVE_GPIO
+     default y
++config WANT_TFT_FSMC
++    bool
++    depends on MACH_STM32F4
++    default y
+ config WANT_ADXL345
+     bool
+     depends on WANT_SPI
+@@ -238,6 +242,9 @@ config WANT_ST7920
+ config WANT_HD44780
+     bool "Support HD44780 LCD display"
+     depends on HAVE_GPIO
++config WANT_TFT_FSMC
++    bool "Support parallel (FSMC) TFT displays (Lerdge, etc.)"
++    depends on MACH_STM32F4
+ comment "Accelerometer chips"
+     depends on WANT_SPI || WANT_I2C
+ config WANT_ADXL345
+diff --git a/src/stm32/Makefile b/src/stm32/Makefile
+index 3c158d518..806d9568d 100644
+--- a/src/stm32/Makefile
++++ b/src/stm32/Makefile
+@@ -67,6 +67,7 @@ src-$(CONFIG_WANT_ADC) += $(adc-src-y)
+ spi-src-y := stm32/spi.c
+ spi-src-$(CONFIG_MACH_STM32H7) := stm32/stm32h7_spi.c
+ src-$(CONFIG_WANT_SPI) += $(spi-src-y)
++src-$(CONFIG_WANT_TFT_FSMC) += stm32/tft_fsmc.c
+ i2c-src-y := stm32/stm32f0_i2c.c
+ i2c-src-$(CONFIG_MACH_STM32F1) := stm32/i2c.c
+ i2c-src-$(CONFIG_MACH_STM32F2) := stm32/i2c.c
+diff --git a/src/stm32/tft_fsmc.c b/src/stm32/tft_fsmc.c
+new file mode 100644
+index 000000000..441f72a70
+--- /dev/null
++++ b/src/stm32/tft_fsmc.c
+@@ -0,0 +1,342 @@
++// Parallel (FSMC) TFT display support for STM32F4 boards (Lerdge, etc.)
++//
++// The host sends low level drawing primitives (controller commands, solid
++// rectangle fills and scaled monochrome bitmaps).  All controller specific
++// knowledge (init sequences, rotation, etc.) lives in the host code.  The
++// MCU only assumes a MIPI DCS compatible controller (ST7796, ILI9488,
++// ILI9341, ST7789, ...) for the window commands 0x2a/0x2b/0x2c.
++//
++// Copyright (C) 2026  Klipper Lerdge TFT contributors
++//
++// This file may be distributed under the terms of the GNU GPLv3 license.
++
++#include "autoconf.h" // CONFIG_MACH_STM32F4
++#include "basecmd.h" // oid_alloc
++#include "board/gpio.h" // gpio_out_write
++#include "board/misc.h" // timer_read_time
++#include "command.h" // DECL_COMMAND
++#include "compiler.h" // ARRAY_SIZE
++#include "internal.h" // gpio_peripheral
++#include "sched.h" // DECL_SHUTDOWN
++
++#define FSMC_AF GPIO_FUNCTION(12)
++
++struct tft_fsmc {
++    volatile uint16_t *reg, *ram;
++};
++
++// Data bus (D0-D15) plus NOE and NWE - shared by all FSMC banks
++static const uint8_t fsmc_bus_pins[] = {
++    GPIO('D', 14), GPIO('D', 15), GPIO('D', 0), GPIO('D', 1),
++    GPIO('E', 7), GPIO('E', 8), GPIO('E', 9), GPIO('E', 10),
++    GPIO('E', 11), GPIO('E', 12), GPIO('E', 13), GPIO('E', 14),
++    GPIO('E', 15), GPIO('D', 8), GPIO('D', 9), GPIO('D', 10),
++    GPIO('D', 4), GPIO('D', 5),
++};
++
++// Chip select pins NE1-NE4
++static const uint8_t fsmc_ne_pins[] = {
++    GPIO('D', 7), GPIO('G', 9), GPIO('G', 10), GPIO('G', 12),
++};
++
++// Address lines A0-A23 (used as the RS / D/C line of the display)
++static const uint8_t fsmc_addr_pins[] = {
++    GPIO('F', 0), GPIO('F', 1), GPIO('F', 2), GPIO('F', 3),
++    GPIO('F', 4), GPIO('F', 5), GPIO('F', 12), GPIO('F', 13),
++    GPIO('F', 14), GPIO('F', 15), GPIO('G', 0), GPIO('G', 1),
++    GPIO('G', 2), GPIO('G', 3), GPIO('G', 4), GPIO('G', 5),
++    GPIO('D', 11), GPIO('D', 12), GPIO('D', 13), GPIO('E', 3),
++    GPIO('E', 4), GPIO('E', 5), GPIO('E', 6), GPIO('E', 2),
++};
++
++
++/****************************************************************
++ * Low level bus access
++ ****************************************************************/
++
++static inline void
++tft_write_reg(struct tft_fsmc *t, uint16_t v)
++{
++    *t->reg = v;
++}
++
++static inline void
++tft_write_data(struct tft_fsmc *t, uint16_t v)
++{
++    *t->ram = v;
++}
++
++static void
++tft_set_window(struct tft_fsmc *t, uint16_t x, uint16_t y
++               , uint16_t w, uint16_t h)
++{
++    uint16_t x1 = x + w - 1, y1 = y + h - 1;
++    tft_write_reg(t, 0x2a);
++    tft_write_data(t, x >> 8);
++    tft_write_data(t, x & 0xff);
++    tft_write_data(t, x1 >> 8);
++    tft_write_data(t, x1 & 0xff);
++    tft_write_reg(t, 0x2b);
++    tft_write_data(t, y >> 8);
++    tft_write_data(t, y & 0xff);
++    tft_write_data(t, y1 >> 8);
++    tft_write_data(t, y1 & 0xff);
++    tft_write_reg(t, 0x2c);
++}
++
++
++/****************************************************************
++ * Commands
++ ****************************************************************/
++
++void
++command_config_tft_fsmc(uint32_t *args)
++{
++    uint32_t bank = args[1], rs_line = args[2];
++    if (bank < 1 || bank > ARRAY_SIZE(fsmc_ne_pins)
++        || rs_line >= ARRAY_SIZE(fsmc_addr_pins))
++        shutdown("Invalid tft_fsmc bank or rs_line");
++    struct tft_fsmc *t = oid_alloc(args[0], command_config_tft_fsmc
++                                   , sizeof(*t));
++
++    // Route pins to the FSMC peripheral
++    int i;
++    for (i = 0; i < ARRAY_SIZE(fsmc_bus_pins); i++)
++        gpio_peripheral(fsmc_bus_pins[i], FSMC_AF | GPIO_HIGH_SPEED, 0);
++    gpio_peripheral(fsmc_ne_pins[bank - 1], FSMC_AF | GPIO_HIGH_SPEED, 0);
++    gpio_peripheral(fsmc_addr_pins[rs_line], FSMC_AF | GPIO_HIGH_SPEED, 0);
++
++    // Enable and configure the controller (SRAM, 16bit, extended timing)
++    RCC->AHB3ENR |= RCC_AHB3ENR_FSMCEN;
++    (void)RCC->AHB3ENR;
++    uint32_t idx = (bank - 1) * 2;
++    FSMC_Bank1->BTCR[idx] = 0;
++    FSMC_Bank1->BTCR[idx + 1] = args[3];
++    FSMC_Bank1E->BWTR[idx] = args[4];
++    FSMC_Bank1->BTCR[idx] = (FSMC_BCR1_MWID_0 | FSMC_BCR1_WREN
++                             | FSMC_BCR1_EXTMOD | FSMC_BCR1_MBKEN);
++
++    // Each 16bit bus access uses HADDR[25:1], so line Ax is address bit x+1
++    uint32_t base = 0x60000000 + (bank - 1) * 0x04000000;
++    t->reg = (volatile uint16_t *)base;
++    t->ram = (volatile uint16_t *)(base | (1 << (rs_line + 1)));
++}
++DECL_COMMAND(command_config_tft_fsmc,
++             "config_tft_fsmc oid=%c bank=%c rs_line=%c btr=%u bwtr=%u");
++
++// Send a controller command followed by optional parameter bytes
++void
++command_tft_fsmc_send_cmd(uint32_t *args)
++{
++    struct tft_fsmc *t = oid_lookup(args[0], command_config_tft_fsmc);
++    uint8_t len = args[2], *data = command_decode_ptr(args[3]);
++    tft_write_reg(t, args[1]);
++    while (len--)
++        tft_write_data(t, *data++);
++}
++// Drawing commands are also allowed after a shutdown so that the host can
++// still show the error state on the screen.
++DECL_COMMAND_FLAGS(command_tft_fsmc_send_cmd, HF_IN_SHUTDOWN,
++             "tft_fsmc_send_cmd oid=%c cmd=%c data=%*s");
++
++// Send a controller command and read back parameter bytes
++void
++command_tft_fsmc_read(uint32_t *args)
++{
++    uint8_t oid = args[0];
++    struct tft_fsmc *t = oid_lookup(oid, command_config_tft_fsmc);
++    uint8_t count = args[2], data[16];
++    if (count > sizeof(data))
++        count = sizeof(data);
++    tft_write_reg(t, args[1]);
++    int i;
++    for (i = 0; i < count; i++)
++        data[i] = *t->ram;
++    sendf("tft_fsmc_read_response oid=%c data=%*s", oid, count, data);
++}
++DECL_COMMAND_FLAGS(command_tft_fsmc_read, HF_IN_SHUTDOWN,
++                   "tft_fsmc_read oid=%c cmd=%c count=%c");
++
++// Fill a rectangle with a solid RGB565 color
++void
++command_tft_fsmc_fill(uint32_t *args)
++{
++    struct tft_fsmc *t = oid_lookup(args[0], command_config_tft_fsmc);
++    uint16_t w = args[3], h = args[4], color = args[5];
++    if (!w || !h)
++        return;
++    tft_set_window(t, args[1], args[2], w, h);
++    uint32_t count = (uint32_t)w * h;
++    while (count--)
++        tft_write_data(t, color);
++}
++DECL_COMMAND_FLAGS(command_tft_fsmc_fill, HF_IN_SHUTDOWN,
++             "tft_fsmc_fill oid=%c x=%hu y=%hu w=%hu h=%hu color=%hu");
++
++// Draw a 1bpp bitmap (rows of 'w' bits, MSB first, each row padded to a
++// byte boundary) where every bit becomes a scale x scale block of pixels.
++void
++command_tft_fsmc_bitmap(uint32_t *args)
++{
++    struct tft_fsmc *t = oid_lookup(args[0], command_config_tft_fsmc);
++    uint16_t x = args[1], y = args[2], w = args[3];
++    uint8_t scale = args[4];
++    uint16_t fg = args[5], bg = args[6];
++    uint8_t len = args[7], *data = command_decode_ptr(args[8]);
++    uint8_t row_bytes = (w + 7) / 8;
++    if (!w || !scale || !row_bytes || len < row_bytes)
++        return;
++    uint8_t rows = len / row_bytes;
++    tft_set_window(t, x, y, w * scale, rows * scale);
++    uint8_t r, sy, sx;
++    uint16_t c;
++    for (r = 0; r < rows; r++, data += row_bytes) {
++        for (sy = 0; sy < scale; sy++) {
++            for (c = 0; c < w; c++) {
++                uint16_t color = data[c >> 3] & (0x80 >> (c & 7)) ? fg : bg;
++                for (sx = 0; sx < scale; sx++)
++                    tft_write_data(t, color);
++            }
++        }
++    }
++}
++DECL_COMMAND_FLAGS(command_tft_fsmc_bitmap, HF_IN_SHUTDOWN,
++             "tft_fsmc_bitmap oid=%c x=%hu y=%hu w=%hu scale=%c"
++             " fg=%hu bg=%hu data=%*s");
++
++// Open a window for streamed pixel data (see tft_fsmc_rle)
++void
++command_tft_fsmc_window(uint32_t *args)
++{
++    struct tft_fsmc *t = oid_lookup(args[0], command_config_tft_fsmc);
++    uint16_t w = args[3], h = args[4];
++    if (!w || !h)
++        return;
++    tft_set_window(t, args[1], args[2], w, h);
++}
++DECL_COMMAND_FLAGS(command_tft_fsmc_window, HF_IN_SHUTDOWN,
++             "tft_fsmc_window oid=%c x=%hu y=%hu w=%hu h=%hu");
++
++// Write RGB565 pixels (big endian) to the open window.  The data is
++// PackBits style encoded: a header byte with the high bit set is followed
++// by one color that is repeated (header & 0x7f) + 1 times, otherwise the
++// header is followed by header + 1 literal colors.
++void
++command_tft_fsmc_rle(uint32_t *args)
++{
++    struct tft_fsmc *t = oid_lookup(args[0], command_config_tft_fsmc);
++    uint8_t len = args[1], *data = command_decode_ptr(args[2]);
++    uint8_t *end = data + len;
++    while (data < end) {
++        uint8_t hdr = *data++, count = (hdr & 0x7f) + 1;
++        if (hdr & 0x80) {
++            if (end - data < 2)
++                return;
++            uint16_t color = (data[0] << 8) | data[1];
++            data += 2;
++            while (count--)
++                tft_write_data(t, color);
++        } else {
++            if (end - data < count * 2)
++                return;
++            while (count--) {
++                tft_write_data(t, (data[0] << 8) | data[1]);
++                data += 2;
++            }
++        }
++    }
++}
++DECL_COMMAND_FLAGS(command_tft_fsmc_rle, HF_IN_SHUTDOWN,
++             "tft_fsmc_rle oid=%c data=%*s");
++
++
++/****************************************************************
++ * XPT2046 resistive touch controller (software SPI)
++ ****************************************************************/
++
++#define TOUCH_SAMPLES 5
++
++struct tft_touch {
++    struct gpio_out cs, sclk, mosi;
++    struct gpio_in miso;
++    uint32_t half_ticks;
++};
++
++static void
++touch_delay(struct tft_touch *tt)
++{
++    uint32_t end = timer_read_time() + tt->half_ticks;
++    while (timer_is_before(timer_read_time(), end))
++        ;
++}
++
++// Send a conversion command and read back the 12 bit result
++static uint16_t
++touch_convert(struct tft_touch *tt, uint8_t cmd)
++{
++    int i;
++    for (i = 0; i < 8; i++, cmd <<= 1) {
++        gpio_out_write(tt->mosi, cmd & 0x80);
++        touch_delay(tt);
++        gpio_out_write(tt->sclk, 1);
++        touch_delay(tt);
++        gpio_out_write(tt->sclk, 0);
++    }
++    gpio_out_write(tt->mosi, 0);
++    uint16_t val = 0;
++    for (i = 0; i < 16; i++) {
++        touch_delay(tt);
++        gpio_out_write(tt->sclk, 1);
++        touch_delay(tt);
++        val = (val << 1) | gpio_in_read(tt->miso);
++        gpio_out_write(tt->sclk, 0);
++    }
++    return (val >> 3) & 0xfff;
++}
++
++static uint16_t
++touch_median(struct tft_touch *tt, uint8_t cmd)
++{
++    uint16_t v[TOUCH_SAMPLES];
++    int i, j;
++    for (i = 0; i < TOUCH_SAMPLES; i++) {
++        uint16_t s = touch_convert(tt, cmd);
++        for (j = i; j > 0 && v[j - 1] > s; j--)
++            v[j] = v[j - 1];
++        v[j] = s;
++    }
++    return v[TOUCH_SAMPLES / 2];
++}
++
++void
++command_config_tft_touch(uint32_t *args)
++{
++    struct tft_touch *tt = oid_alloc(args[0], command_config_tft_touch
++                                     , sizeof(*tt));
++    tt->cs = gpio_out_setup(args[1], 1);
++    tt->sclk = gpio_out_setup(args[2], 0);
++    tt->mosi = gpio_out_setup(args[3], 0);
++    tt->miso = gpio_in_setup(args[4], 0);
++    tt->half_ticks = args[5];
++}
++DECL_COMMAND(command_config_tft_touch,
++             "config_tft_touch oid=%c cs_pin=%u sclk_pin=%u mosi_pin=%u"
++             " miso_pin=%u half_ticks=%u");
++
++// Read pressure (z1 + 4095 - z2) and the median X/Y position
++void
++command_tft_touch_read(uint32_t *args)
++{
++    uint8_t oid = args[0];
++    struct tft_touch *tt = oid_lookup(oid, command_config_tft_touch);
++    gpio_out_write(tt->cs, 0);
++    uint16_t z1 = touch_convert(tt, 0xb0), z2 = touch_convert(tt, 0xc0);
++    uint16_t x = touch_median(tt, 0xd0);
++    // The last conversion uses power-down mode 0 so PENIRQ stays enabled
++    uint16_t y = touch_median(tt, 0x90);
++    gpio_out_write(tt->cs, 1);
++    sendf("tft_touch_result oid=%c z=%hu x=%hu y=%hu"
++          , oid, z1 + 4095 - z2, x, y);
++}
++DECL_COMMAND_FLAGS(command_tft_touch_read, HF_IN_SHUTDOWN,
++                   "tft_touch_read oid=%c");
+-- 
+2.45.2.windows.1
+

@@ -1,0 +1,149 @@
+From 9f2880c9a39c89c5b9a4fb7a31997ed7b3c515d5 Mon Sep 17 00:00:00 2001
+From: Artem Fesunenko <body051@gmail.com>
+Date: Sat, 3 Oct 2026 07:56:47 +0300
+Subject: [PATCH 2/5] stm32: Add an optional fallback baud rate for serial
+ ports
+
+When SERIAL_BAUD_FALLBACK is set, the MCU alternates between the main
+and the fallback baud rate every 20 seconds until the first valid
+message is received.  This allows trying high baud rates without the
+risk of losing the connection if the wiring can not handle them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/Kconfig              |  9 ++++++++
+ src/generic/serial_irq.c |  5 +++-
+ src/generic/serial_irq.h |  1 +
+ src/stm32/serial.c       | 49 ++++++++++++++++++++++++++++++++++++----
+ 4 files changed, 59 insertions(+), 5 deletions(-)
+
+diff --git a/src/Kconfig b/src/Kconfig
+index 8efed1dad..56bd8494e 100644
+--- a/src/Kconfig
++++ b/src/Kconfig
+@@ -56,6 +56,15 @@ config SERIAL_BAUD
+     help
+         Specify the baud rate of the serial port. This should be set
+         to 250000. Read the FAQ before changing this value.
++config SERIAL_BAUD_FALLBACK
++    depends on SERIAL && MACH_STM32
++    int "Fallback baud rate if no valid data is received (0 to disable)" if LOW_LEVEL_OPTIONS
++    default 0
++    help
++        Until the first valid message is received, alternate between
++        the main baud rate and this rate every 20 seconds.  This allows a
++        host to connect at this rate if the main baud rate does not work
++        on the wiring.
+ 
+ # Generic configuration options for USB
+ config USBSERIAL
+diff --git a/src/generic/serial_irq.c b/src/generic/serial_irq.c
+index 4c05ef3ef..262d7c52b 100644
+--- a/src/generic/serial_irq.c
++++ b/src/generic/serial_irq.c
+@@ -17,6 +17,7 @@
+ #define RX_BUFFER_SIZE 192
+ 
+ static uint8_t receive_buf[RX_BUFFER_SIZE], receive_pos;
++uint8_t serial_rx_valid;
+ static uint8_t transmit_buf[96], transmit_pos, transmit_max;
+ 
+ DECL_CONSTANT("SERIAL_BAUD", CONFIG_SERIAL_BAUD);
+@@ -76,8 +77,10 @@ console_task(void)
+ {
+     uint_fast8_t rpos = readb(&receive_pos), pop_count;
+     int_fast8_t ret = command_find_block(receive_buf, rpos, &pop_count);
+-    if (ret > 0)
++    if (ret > 0) {
++        serial_rx_valid = 1;
+         command_dispatch(receive_buf, pop_count);
++    }
+     if (ret) {
+         if (CONFIG_HAVE_BOOTLOADER_REQUEST && ret < 0 && pop_count == 32
+             && !memcmp(receive_buf, " \x1c Request Serial Bootloader!! ~", 32))
+diff --git a/src/generic/serial_irq.h b/src/generic/serial_irq.h
+index 9aa96ab19..d16366851 100644
+--- a/src/generic/serial_irq.h
++++ b/src/generic/serial_irq.h
+@@ -9,5 +9,6 @@ void serial_enable_tx_irq(void);
+ // serial_irq.c
+ void serial_rx_byte(uint_fast8_t data);
+ int serial_get_tx_byte(uint8_t *pdata);
++extern uint8_t serial_rx_valid;
+ 
+ #endif // serial_irq.h
+diff --git a/src/stm32/serial.c b/src/stm32/serial.c
+index b78b5afbf..43b5658cb 100644
+--- a/src/stm32/serial.c
++++ b/src/stm32/serial.c
+@@ -6,6 +6,7 @@
+ 
+ #include "autoconf.h" // CONFIG_SERIAL_BAUD
+ #include "board/armcm_boot.h" // armcm_enable_irq
++#include "board/misc.h" // timer_read_time
+ #include "board/serial_irq.h" // serial_rx_byte
+ #include "command.h" // DECL_CONSTANT_STR
+ #include "internal.h" // enable_pclock
+@@ -98,15 +99,55 @@ serial_enable_tx_irq(void)
+     USARTx->CR1 = CR1_FLAGS | USART_CR1_TXEIE;
+ }
+ 
++static void
++serial_set_baud(uint32_t baud)
++{
++    uint32_t pclk = get_pclock_frequency((uint32_t)USARTx);
++    uint32_t div = DIV_ROUND_CLOSEST(pclk, baud);
++    USARTx->BRR = (((div / 16) << USART_BRR_DIV_Mantissa_Pos)
++                   | ((div % 16) << USART_BRR_DIV_Fraction_Pos));
++}
++
++// Until a valid message arrives, alternate between the configured and
++// the fallback baud rate so that a host using either rate can connect.
++#define FALLBACK_PERIOD_MS 20000
++
++void
++serial_fallback_task(void)
++{
++    static uint8_t done, use_fallback;
++    static uint32_t last, elapsed_ms, ticks;
++    if (!CONFIG_SERIAL_BAUD_FALLBACK || done)
++        return;
++    if (serial_rx_valid) {
++        done = 1;
++        return;
++    }
++    uint32_t now = timer_read_time();
++    if (!last)
++        last = now;
++    ticks += now - last;
++    last = now;
++    uint32_t ms_ticks = timer_from_us(1000);
++    while (ticks >= ms_ticks) {
++        ticks -= ms_ticks;
++        elapsed_ms++;
++    }
++    if (elapsed_ms >= FALLBACK_PERIOD_MS) {
++        elapsed_ms = 0;
++        use_fallback = !use_fallback;
++        serial_set_baud(use_fallback ? CONFIG_SERIAL_BAUD_FALLBACK
++                        : CONFIG_SERIAL_BAUD);
++    }
++}
++DECL_TASK(serial_fallback_task);
++
+ void
+ serial_init(void)
+ {
+     enable_pclock((uint32_t)USARTx);
+ 
+-    uint32_t pclk = get_pclock_frequency((uint32_t)USARTx);
+-    uint32_t div = DIV_ROUND_CLOSEST(pclk, CONFIG_SERIAL_BAUD);
+-    USARTx->BRR = (((div / 16) << USART_BRR_DIV_Mantissa_Pos)
+-                   | ((div % 16) << USART_BRR_DIV_Fraction_Pos));
++    serial_set_baud(CONFIG_SERIAL_BAUD);
+     USARTx->CR1 = CR1_FLAGS;
+     armcm_enable_irq(USARTx_IRQHandler, USARTx_IRQn, 0);
+ 
+-- 
+2.45.2.windows.1
+

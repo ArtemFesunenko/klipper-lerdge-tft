@@ -1,0 +1,15 @@
+[Unit]
+Description=Mirror KlipperScreen to the Lerdge TFT
+Requires=lerdge-xvfb.service
+After=lerdge-xvfb.service klipper.service
+
+[Service]
+Type=simple
+User=@USER@
+Environment=DISPLAY=@DISPLAY@
+ExecStart=/usr/bin/python3 @KLIPPER_DIR@/scripts/lerdge_mirror.py -d @DISPLAY@ -s @DATA_DIR@/comms/klippy.sock
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

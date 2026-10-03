@@ -1,0 +1,14 @@
+[Unit]
+Description=Virtual X display for the Lerdge TFT
+After=network.target
+
+[Service]
+Type=simple
+User=@USER@
+ExecStartPre=/bin/mkdir -p /dev/shm/lerdge
+ExecStart=/usr/bin/Xvfb @DISPLAY@ -screen 0 480x320x24 -fbdir /dev/shm/lerdge -nolisten tcp
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
