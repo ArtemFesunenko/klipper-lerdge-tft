@@ -94,10 +94,13 @@ for firmware updates).
 
 Notes:
 
-- A card that was accessed in SPI mode (for example by `flash-sdcard.sh`
-  with a software SPI board definition) stays in SPI mode until it loses
-  power, and the bootloader can then not read it. The `lerdge-k`/
-  `lerdge-x` definitions therefore use SDIO.
+- A card that was accessed in SPI mode stays in SPI mode until it loses
+  power, and the bootloader (SDIO) can then not read it. The `lerdge-k`/
+  `lerdge-x` definitions write the card with software SPI (Klipper's SDIO
+  writes failed on the tested board and left the card unresponsive), so
+  the printer has to be switched off and on after an upload. The
+  installer then verifies the firmware and removes the file at the next
+  start of the host (`lerdge-firmware-finish.service`).
 - Klipper must keep the last 16 bytes of RAM free
   (`STM32_LERDGE_RAM_RESERVE`, RAM size `0x1FFF0`), otherwise it does not
   start from the Lerdge bootloader.

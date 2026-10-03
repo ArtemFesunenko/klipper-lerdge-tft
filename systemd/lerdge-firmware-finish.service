@@ -1,0 +1,14 @@
+[Unit]
+Description=Finish a Lerdge firmware update (verify and remove it from the TF card)
+After=local-fs.target
+Before=klipper.service
+ConditionPathExists=@FLAG@
+
+[Service]
+Type=oneshot
+User=@USER@
+ExecStart=@REPO_DIR@/lerdge-firmware-finish.sh @ENV_FILE@
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

@@ -30,10 +30,13 @@ while [ $# -gt 0 ]; do
 done
 
 PRINTER_CFG="$DATA_DIR/config/printer.cfg"
+rm -f "$DATA_DIR/systemd/lerdge-firmware.env" \
+      "$DATA_DIR/systemd/lerdge-firmware.pending"
 
 if [ "$DO_SERVICES" = "1" ]; then
     echo "==> Removing the KlipperScreen mirror services"
-    for unit in lerdge-mirror KlipperScreen-lerdge lerdge-xvfb; do
+    for unit in lerdge-mirror KlipperScreen-lerdge lerdge-xvfb \
+                lerdge-firmware-finish; do
         if [ -f "/etc/systemd/system/$unit.service" ]; then
             sudo systemctl disable --now "$unit" || true
             sudo rm -f "/etc/systemd/system/$unit.service"

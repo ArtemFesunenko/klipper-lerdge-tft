@@ -76,11 +76,14 @@ Usage: ./install.sh [options]
 Installs Lerdge TFT touch screen support into an existing Klipper setup.
 
 Modes:
-  (default)          Patch Klipper, build and flash the firmware, configure
-  --finish           Complete the installation after a manual (TF card)
-                     firmware flash: verify, configure, start services
+  (default)          Patch Klipper, build the firmware, write it to the TF
+                     card of the board (or create a file for it) and
+                     configure Klipper.  The installation completes after
+                     the printer was switched off and on once.
+  --finish           Complete the installation now (after switching the
+                     printer off and on, when the host was not restarted)
   --update           Update Klipper from upstream, re-apply the patches,
-                     rebuild and flash the firmware
+                     rebuild and install the firmware
   --build-only       Only patch Klipper and build the firmware
 
 Options:
@@ -89,11 +92,13 @@ Options:
   --mirror           Show KlipperScreen on the Lerdge screen
   --no-mirror        Use the built-in Klipper menu on the Lerdge screen
   --flash sd|file|none
-                     sd:   flash remotely through the TF card in the board
-                           (the board must already run Klipper)
-                     file: create the firmware file for a manual TF card
-                           flash (first installation over stock firmware)
-                     none: do not flash
+                     sd:   write the firmware to the TF card in the board
+                           through the running firmware (the board must
+                           already run Klipper)
+                     file: create the firmware file to copy to the TF card
+                           yourself (first installation over the stock
+                           Lerdge firmware)
+                     none: only build the firmware
   --serial DEV       MCU serial port (default: from printer.cfg)
   --base REF         Klipper commit to apply the patches to
   --klipper DIR      Klipper directory (default: $KLIPPER_DIR)
@@ -406,18 +411,12 @@ write_firmware_file() {
         "$KLIPPER_DIR/out/klipper.bin" "$FIRMWARE_OUT" >/dev/null
     local sys="Lerdge_${BOARD^^}_system"
     ok "Created $FIRMWARE_OUT/$sys/Firmware/Lerdge_${BOARD^^}_firmware_force.bin"
-    cat <<EOF
-
-    To install the firmware:
-      1. Copy the folder "$sys" from $FIRMWARE_OUT
-         to the root of a FAT32 formatted TF (micro SD) card, for example:
-           scp -r $(whoami)@$(hostname -I 2>/dev/null | awk '{print $1}'):$FIRMWARE_OUT/$sys .
-      2. Insert the card into the TF slot of the Lerdge board.
-      3. Switch the printer off and on.  The Lerdge bootloader installs the
-         firmware (this takes a few seconds).
-      4. Leave the card in the board (it allows remote updates later) and
-         run:  $FINISH_CMD
-EOF
+    MANUAL_COPY_TEXT="
+      Copy the folder \"$sys\" from $FIRMWARE_OUT to the root of a FAT32
+      formatted TF (micro SD) card, for example from your computer:
+        scp -r $(whoami)@$(hostname -I 2>/dev/null | awk '{print $1}'):$FIRMWARE_OUT/$sys .
+      and insert the card into the TF slot of the Lerdge board.
+"
 }
 
 current_baud() {
@@ -434,68 +433,83 @@ serial_device() {
     fi
 }
 
-# Flash via the TF card using the running Klipper firmware
-flash_sd() {
-    local mode="$1" baud="$2" dev log rc
+# Upload the firmware to the TF card in the board through the running
+# Klipper firmware.  The bootloader can only read the card after a power
+# cycle, so the new version is not active yet afterwards.
+upload_sd() {
+    local dev log
     dev="$(serial_device)"
     [ -n "$dev" ] || die "Unknown MCU serial port (use --serial)"
     log=/tmp/lerdge-flash.log
+    step "Writing the firmware to the TF card in the board"
     sysctl stop "$KLIPPER_SERVICE" \
         || die "Could not stop the $KLIPPER_SERVICE service"
     set +e
-    (cd "$KLIPPER_DIR" && ./scripts/flash-sdcard.sh $mode -b "$baud" \
+    (cd "$KLIPPER_DIR" && ./scripts/flash-sdcard.sh -b "$(current_baud)" \
         "$dev" "lerdge-$BOARD") >"$log" 2>&1
-    rc=$?
     set -e
-    grep -v '^  ' "$log" | grep -E 'Connected|Upload|Verif|Version|Firmware|deleted|Error|SD Card' || true
-    FLASH_RESULT=other
-    if grep -q "Firmware Flash Successful" "$log"; then
-        FLASH_RESULT=ok
+    grep -v '^  ' "$log" | grep -E '^(Connected|Uploading|Validating|Firmware Upload|SD Card Flash Error)' || true
+    if grep -q "Firmware Upload Complete" "$log"; then
+        ok "Firmware written to the TF card"
         return 0
     fi
-    grep -q "Version Mismatch" "$log" && FLASH_RESULT=mismatch
+    sysctl start "$KLIPPER_SERVICE"
     if grep -q "Failed to Initialize SD Card" "$log"; then
-        warn "No usable TF card in the Lerdge board. Insert a FAT32 formatted
-         TF card into the board's TF slot and try again, or use --flash file."
-    elif grep -q "Version Mismatch" "$log"; then
-        warn "The bootloader did not install the new firmware after a reset.
-         Switch the printer off and on, then run: $FINISH_CMD"
-    elif [ $rc != 0 ]; then
-        warn "flash-sdcard.sh failed, see $log"
+        die "No usable TF card in the Lerdge board. Insert a FAT32 formatted
+       TF card into the board's TF slot and run the installer again, or
+       use --flash file."
+    elif grep -q "Unable to connect" "$log"; then
+        die "Could not connect to the board at $(current_baud) baud on $dev.
+       Does it run Klipper?  For the first installation use --flash file."
     fi
-    return 1
+    die "Writing the firmware failed, see $log"
 }
 
-flash_firmware() {
+choose_flash_mode() {
     if [ -z "$FLASH" ]; then
         info "How should the firmware be installed?"
-        info "  sd   - remotely through a TF card in the Lerdge board (the board"
-        info "         already runs Klipper - recommended for updates)"
-        info "  file - create a file for a manual TF card flash (needed for the"
-        info "         first installation over the stock Lerdge firmware)"
-        info "  none - do not install the firmware now"
+        info "  sd   - through the TF card in the Lerdge board, written by the"
+        info "         installer (the board must already run Klipper)"
+        info "  file - create a file to copy to the TF card yourself (needed for"
+        info "         the first installation over the stock Lerdge firmware)"
+        info "  none - only build the firmware"
         ask "Firmware installation (sd/file/none)?" "sd"
         FLASH="$REPLY"
     fi
-    case "$FLASH" in
-        sd)
-            step "Flashing the firmware through the TF card in the board"
-            if flash_sd "" "$(current_baud)"; then
-                ok "Firmware installed"
-                return 0
-            fi
-            return 1
-            ;;
-        file)
-            write_firmware_file
-            return 1
-            ;;
-        none)
-            info "Skipping the firmware installation"
-            return 1
-            ;;
-        *) die "Unknown flash mode '$FLASH'";;
-    esac
+    case "$FLASH" in sd|file|none) ;; *) die "Unknown flash mode '$FLASH'";; esac
+}
+
+# The bootloader installs the firmware file on every start, so it has to
+# be removed after the update.  A one-shot service does this (and checks
+# the firmware version) at the next start of the host, before Klipper.
+setup_finisher() {
+    step "Setting up the firmware check for the next start"
+    local env_file="$DATA_DIR/systemd/lerdge-firmware.env"
+    local fallback=$FALLBACK_BAUD
+    [ "$BAUD" = "$FALLBACK_BAUD" ] && fallback=""
+    mkdir -p "$DATA_DIR/systemd" "$DATA_DIR/logs"
+    cat > "$env_file" <<EOF
+KLIPPER_DIR=$KLIPPER_DIR
+BOARD=$BOARD
+BAUDS="$BAUD $fallback"
+SERIAL=$(serial_device)
+FLAG=$DATA_DIR/systemd/lerdge-firmware.pending
+LOG=$DATA_DIR/logs/lerdge-firmware.log
+EOF
+    touch "$DATA_DIR/systemd/lerdge-firmware.pending"
+    sed -e "s|@USER@|$(whoami)|g" -e "s|@REPO_DIR@|$REPO_DIR|g" \
+        -e "s|@ENV_FILE@|$env_file|g" \
+        -e "s|@FLAG@|$DATA_DIR/systemd/lerdge-firmware.pending|g" \
+        -e "s|klipper.service|$KLIPPER_SERVICE.service|g" \
+        "$REPO_DIR/systemd/lerdge-firmware-finish.service" \
+        > /tmp/lerdge-firmware-finish.service
+    if [ "$DO_SERVICES" = "1" ]; then
+        sudo install -m 644 /tmp/lerdge-firmware-finish.service \
+            /etc/systemd/system/
+    fi
+    sysctl daemon-reload
+    sysctl enable lerdge-firmware-finish
+    ok "The firmware will be checked and removed from the card at the next start"
 }
 
 ######################################################################
@@ -648,26 +662,7 @@ remove_mirror() {
 # Finishing
 ######################################################################
 
-finish_install() {
-    step "Checking the installed firmware"
-    local want
-    want="$(python3 -c "import json;print(json.load(open('$KLIPPER_DIR/out/klipper.dict'))['version'])" 2>/dev/null || true)"
-    # Verify the version and remove the firmware file from the TF card.
-    # The MCU alternates between the new and the fallback baud rate until
-    # it is contacted, so either one works.
-    if flash_sd "-c" "$BAUD" || { [ "$FLASH_RESULT" != "mismatch" ] \
-            && flash_sd "-c" "$FALLBACK_BAUD"; }; then
-        ok "The board runs the new firmware ($want)"
-    elif [ "$FLASH_RESULT" = "mismatch" ]; then
-        sysctl start "$KLIPPER_SERVICE"
-        die "The board still runs another firmware version. Install the
-       firmware first (see above), then run --finish again."
-    else
-        warn "Could not verify the firmware through the TF card. If the board
-         does not connect, check that the firmware was installed.  Remove the
-         Lerdge_${BOARD^^}_system folder from the TF card if it is not in the
-         board, otherwise the bootloader installs it on every power up."
-    fi
+configure_all() {
     configure_printer
     if [ "$MIRROR" = "1" ]; then
         install_mirror
@@ -676,29 +671,62 @@ finish_install() {
     fi
     add_update_manager
     save_state
+}
+
+print_power_cycle() {
+    cat <<EOF
+
+    ${MANUAL_COPY_TEXT}
+    To complete the installation the printer has to be switched off and on
+    once, so that the Lerdge bootloader installs the new firmware:
+
+      * Host powered by the printer: shut the host down first
+            sudo poweroff
+        wait until it is off, then switch the printer off, wait 10 seconds
+        and switch it on again.  Everything else happens automatically at
+        the next start (the result is logged to
+        $DATA_DIR/logs/lerdge-firmware.log).
+
+      * Host with its own power supply: switch the printer off and on,
+        then run
+            $FINISH_CMD
+
+    The Lerdge screen then shows five crosses for the touch calibration:
+    tap their centers, then run SAVE_CONFIG.
+EOF
+}
+
+# Verify the new firmware, remove it from the TF card and start Klipper
+finish_now() {
+    step "Checking the firmware on the board"
+    local env_file="$DATA_DIR/systemd/lerdge-firmware.env"
+    [ -f "$env_file" ] || die "Nothing to finish (no $env_file)"
+    sysctl stop "$KLIPPER_SERVICE" \
+        || die "Could not stop the $KLIPPER_SERVICE service"
+    touch "$DATA_DIR/systemd/lerdge-firmware.pending"
+    if "$REPO_DIR/lerdge-firmware-finish.sh" "$env_file"; then
+        ok "The board runs the new firmware"
+    else
+        warn "The firmware check failed, see $DATA_DIR/logs/lerdge-firmware.log"
+    fi
     step "Starting Klipper"
-    sysctl restart "$KLIPPER_SERVICE"
+    sysctl start "$KLIPPER_SERVICE"
     if [ "$DO_SERVICES" = "1" ]; then
         if wait_klipper_ready; then
             ok "Klipper is ready (MCU firmware: $(mcu_version))"
         else
-            warn "Klipper is not ready yet - check the Klipper log
-         ($DATA_DIR/logs/klippy.log).  If the MCU does not connect at $BAUD
-         baud, set 'baud: $FALLBACK_BAUD' in the [mcu] section."
+            warn "Klipper is not ready yet - check $DATA_DIR/logs/klippy.log.
+         If the MCU does not connect at $BAUD baud, set 'baud: $FALLBACK_BAUD'
+         in the [mcu] section of printer.cfg and restart Klipper."
         fi
     fi
-    cat <<EOF
-
-    Done!  If the touch screen has not been calibrated yet, the Lerdge
-    screen shows five crosses: tap their centers, then run SAVE_CONFIG.
-    Recalibrate any time with the TOUCH_CALIBRATE command.
-EOF
 }
 
 ######################################################################
 # Main
 ######################################################################
 
+MANUAL_COPY_TEXT=""
 check_environment
 choose_options
 case "$MODE" in
@@ -708,23 +736,29 @@ case "$MODE" in
         build_firmware
         ;;
     finish)
-        [ -f "$KLIPPER_DIR/out/klipper.dict" ] || die "No firmware build found - run ./install.sh first"
-        if [ "$MIRROR" = "1" ]; then install_packages; fi
-        finish_install
+        finish_now
         ;;
     install|update)
+        choose_flash_mode
         patch_klipper
         install_packages
         build_firmware
-        if flash_firmware; then
-            finish_install
-        else
-            if [ "$FLASH" = "sd" ]; then
-                sysctl start "$KLIPPER_SERVICE"
-            fi
-            step "Not finished yet"
-            info "After the firmware is installed on the board, run:"
-            info "  $FINISH_CMD"
-        fi
+        case "$FLASH" in
+            none)
+                step "Firmware built"
+                info "Install out/klipper.bin and run the installer again."
+                ;;
+            sd|file)
+                if [ "$FLASH" = "sd" ]; then
+                    upload_sd
+                else
+                    write_firmware_file
+                fi
+                configure_all
+                setup_finisher
+                step "Almost done"
+                print_power_cycle
+                ;;
+        esac
         ;;
 esac

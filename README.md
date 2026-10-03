@@ -28,6 +28,7 @@ it, or the built-in Klipper menu. Everything installs with one script.
   - [2. Run the installer](#2-run-the-installer)
   - [3a. First installation (board runs the stock Lerdge firmware)](#3a-first-installation-board-runs-the-stock-lerdge-firmware)
   - [3b. Board already runs Klipper](#3b-board-already-runs-klipper)
+  - [3c. Switching the printer off and on](#3c-switching-the-printer-off-and-on)
   - [4. Touch calibration](#4-touch-calibration)
 - [Using the screen](#using-the-screen)
 - [Configuration](#configuration)
@@ -53,9 +54,10 @@ it, or the built-in Klipper menu. Everything installs with one script.
 - **Works after errors** – the touch panel is read by the board itself, so
   after a Klipper shutdown you can still press *Firmware Restart* on the
   screen.
-- **Remote firmware updates** – the firmware is installed through the TF
-  card in the board by the stock Lerdge bootloader, started from the host.
-  After the first installation you never need to touch the card again.
+- **Firmware updates from the host** – the installer writes the firmware
+  to the TF card in the board, the stock Lerdge bootloader installs it when
+  the printer is switched on, and the file is removed automatically. After
+  the first installation you never need to take the card out.
 - **Fast and safe serial link** – up to 1.5 Mbaud between the host and the
   board, with an automatic fallback to 250000 baud if the wiring can not
   handle it.
@@ -141,7 +143,7 @@ The installer asks a few questions (all have sensible defaults):
 | Board type | `k` for Lerdge-K, `x` for Lerdge-X |
 | Show KlipperScreen on the Lerdge screen | `y` for KlipperScreen, `n` for the built-in menu |
 | MCU serial baud rate | `1500000` (recommended for KlipperScreen) or `250000` |
-| Firmware installation | `file` for the first installation, `sd` if the board already runs Klipper |
+| Firmware installation | `file` for the first installation, `sd` if the board already runs Klipper (and has a TF card) |
 
 It then applies the patches to Klipper, installs the needed packages
 (ARM compiler, and for KlipperScreen: Xvfb, numpy, python-xlib) and builds
@@ -159,42 +161,43 @@ Run `./install.sh --help` for all options.
 
 Choose `file`. The installer creates
 `~/lerdge_firmware/Lerdge_K_system/Firmware/Lerdge_K_firmware_force.bin`
-(`Lerdge_X_...` for Lerdge-X).
+(`Lerdge_X_...` for Lerdge-X), configures Klipper and prints what to do:
 
 1. Copy the whole `Lerdge_K_system` folder to the **root** of the FAT32 TF
-   card (the installer prints an `scp` command for this).
-2. Insert the card into the TF slot of the Lerdge board.
-3. **Shut the host down cleanly** (`sudo poweroff`), then switch the printer
-   off and on. The Lerdge bootloader installs the firmware in a few
-   seconds (it may show messages about logo/UI/font updates – they are
-   harmless).
-4. **Leave the card in the board** and run:
-
-   ```bash
-   ~/klipper-lerdge-tft/install.sh --finish
-   ```
-
-   This verifies the firmware, deletes the firmware file from the card
-   (otherwise the bootloader would install it again on every power up),
-   configures Klipper and starts everything.
-
-> If your `printer.cfg` was written for the stock firmware connection, set
-> the `[mcu]` `serial:` to the port of the board (for example
-> `/dev/ttyUSB0`, `/dev/serial/by-id/...` or the UART of your host such as
-> `/dev/ttyS3`) before running `--finish`.
+   card (the installer prints an `scp` command for this) and insert the
+   card into the TF slot of the Lerdge board. **Leave it there** - it is
+   used for later updates too.
+2. If the `[mcu]` section of `printer.cfg` was written for the stock
+   firmware connection, set `serial:` to the port of the board (for
+   example `/dev/ttyUSB0`, `/dev/serial/by-id/...` or the UART of your host
+   such as `/dev/ttyS3`).
+3. Switch the printer off and on (see [3c](#3c-switching-the-printer-off-and-on)).
 
 ### 3b. Board already runs Klipper
 
 If the board already runs a Klipper firmware built for the Lerdge
 bootloader (64KiB bootloader offset) and a FAT32 card is in its TF slot,
-choose `sd`. The installer stops Klipper, writes the new firmware to the
-card through the running firmware, resets the board, verifies the new
-version, deletes the file from the card and finishes the installation –
-no need to touch the printer.
+choose `sd`. The installer writes the new firmware to the card through the
+running firmware and configures Klipper. Then switch the printer off and
+on (see [3c](#3c-switching-the-printer-off-and-on)).
 
-> If the remote update reports that the firmware version did not change,
-> the card was left in SPI mode by an earlier tool: switch the printer off
-> and on once and run `./install.sh --finish`.
+### 3c. Switching the printer off and on
+
+The Lerdge bootloader reads the card only after the power was off (the
+card has to leave the mode the installer used to write it), so the printer
+has to be switched off and on once after every firmware installation:
+
+- **Host powered by the printer:** shut the host down first
+  (`sudo poweroff`), wait until it is off, switch the printer off, wait 10
+  seconds and switch it on. When the host starts, a one-shot service checks
+  the new firmware and removes the file from the card before Klipper
+  starts - nothing else to do. The result is logged to
+  `~/printer_data/logs/lerdge-firmware.log`.
+- **Host with its own power supply:** switch the printer off and on, then
+  run `~/klipper-lerdge-tft/install.sh --finish`.
+
+The bootloader installs the firmware in a few seconds (it may show
+messages about logo/UI/font updates - they are harmless).
 
 ### 4. Touch calibration
 
@@ -271,8 +274,9 @@ git pull
 ```
 
 This fetches the latest upstream Klipper, re-applies the patches, updates
-the Klipper python packages, rebuilds the firmware and installs it through
-the TF card. The other components (Moonraker, Mainsail/Fluidd,
+the Klipper python packages, rebuilds the firmware and writes it to the TF
+card - then switch the printer off and on as in
+[3c](#3c-switching-the-printer-off-and-on). The other components (Moonraker, Mainsail/Fluidd,
 KlipperScreen) can be updated from the web interface as usual.
 
 ## Serial baud rate
@@ -328,10 +332,13 @@ journalctl -u lerdge-mirror -n 50
 tail -50 ~/printer_data/logs/KlipperScreen-lerdge.log
 ```
 
-**The remote firmware update fails**
-"Failed to Initialize SD Card": insert a FAT32 card into the board.
-"Version Mismatch": switch the printer off and on once (the card was left
-in SPI mode), then run `./install.sh --finish`.
+**The firmware update fails**
+"No usable TF card": insert a FAT32 formatted card into the board's TF
+slot. "Could not connect to the board": the board does not run Klipper
+(use `--flash file`) or the baud rate in `[mcu]` is wrong. If the board
+still runs the old firmware after switching it off and on, check
+`~/printer_data/logs/lerdge-firmware.log` and that the `Lerdge_K_system`
+folder is in the root of the card.
 
 **The picture is upside down**
 Set `rotate_180: True` in `lerdge_tft.cfg`.

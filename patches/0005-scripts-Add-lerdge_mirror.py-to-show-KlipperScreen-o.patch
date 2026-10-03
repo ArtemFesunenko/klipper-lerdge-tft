@@ -1,6 +1,6 @@
-From 00a994aeda966c95c8aaef040882fa8e41c26fa9 Mon Sep 17 00:00:00 2001
+From a3400688fd905cdb2b19e12dc2f290fdb353f71f Mon Sep 17 00:00:00 2001
 From: Artem Fesunenko <body051@gmail.com>
-Date: Sat, 3 Oct 2026 07:56:48 +0300
+Date: Sat, 3 Oct 2026 08:19:39 +0300
 Subject: [PATCH 5/5] scripts: Add lerdge_mirror.py to show KlipperScreen on
  Lerdge TFTs
 

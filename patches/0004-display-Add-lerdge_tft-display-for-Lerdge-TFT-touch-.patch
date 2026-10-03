@@ -1,6 +1,6 @@
-From 526ecd991e795385ccde9e17983034a712c17c32 Mon Sep 17 00:00:00 2001
+From a39b5183922ef9dc3c58b4dfaad9788959d559fa Mon Sep 17 00:00:00 2001
 From: Artem Fesunenko <body051@gmail.com>
-Date: Sat, 3 Oct 2026 07:56:48 +0300
+Date: Sat, 3 Oct 2026 08:19:38 +0300
 Subject: [PATCH 4/5] display: Add lerdge_tft display for Lerdge TFT touch
  screens
 
@@ -13,11 +13,11 @@ screen and receive touch events.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  config/sample-lerdge-tft.cfg        |   63 ++
- docs/Lerdge_TFT.md                  |  164 +++++
+ docs/Lerdge_TFT.md                  |  173 +++++
  klippy/extras/display/display.cfg   |   68 ++
  klippy/extras/display/display.py    |    6 +-
  klippy/extras/display/lerdge_tft.py | 1050 +++++++++++++++++++++++++++
- 5 files changed, 1350 insertions(+), 1 deletion(-)
+ 5 files changed, 1359 insertions(+), 1 deletion(-)
  create mode 100644 config/sample-lerdge-tft.cfg
  create mode 100644 docs/Lerdge_TFT.md
  create mode 100644 klippy/extras/display/lerdge_tft.py
@@ -93,10 +93,10 @@ index 000000000..d30d4f6ec
 +#display_group: _lerdge_16x6
 diff --git a/docs/Lerdge_TFT.md b/docs/Lerdge_TFT.md
 new file mode 100644
-index 000000000..447e2c39c
+index 000000000..c9c67de1b
 --- /dev/null
 +++ b/docs/Lerdge_TFT.md
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,173 @@
 +# Сенсорный экран Lerdge (TFT по FSMC) в Klipper
 +
 +Этот форк добавляет в Klipper поддержку штатных сенсорных экранов плат
@@ -243,9 +243,18 @@ index 000000000..447e2c39c
 +./scripts/flash-sdcard.sh -b 1500000 /dev/ttyS3 lerdge-k
 +```
 +
-+Загрузчик Lerdge читает карту по SDIO, поэтому используется плата
-+`lerdge-k` (SDIO). Если карту перевели в режим SPI (`lerdge-k-spi`),
-+до выключения питания загрузчик её не увидит.
++Прошивка записывается на карту через работающую прошивку (программный
++SPI). Загрузчик Lerdge читает карту в режиме SDIO, а карта, к которой
++обращались по SPI, возвращается в режим SDIO только после снятия питания.
++Поэтому после записи выключите хост, выключите и включите принтер, а затем
++выполните проверку – она сверит версию и удалит файл с карты (иначе
++загрузчик ставит прошивку при каждом включении):
++
++```
++sudo systemctl stop klipper
++./scripts/flash-sdcard.sh -c -b 1500000 /dev/ttyS3 lerdge-k
++sudo systemctl start klipper
++```
 +
 +## Возможные проблемы
 +
