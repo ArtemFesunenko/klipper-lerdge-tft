@@ -448,7 +448,11 @@ upload_sd() {
     (cd "$KLIPPER_DIR" && ./scripts/flash-sdcard.sh -b "$(current_baud)" \
         "$dev" "lerdge-$BOARD") >"$log" 2>&1
     set -e
-    grep -v '^  ' "$log" | grep -E '^(Connected|Uploading|Validating|Firmware Upload|SD Card Flash Error)' || true
+    # A version mismatch after the upload is expected (the bootloader can
+    # only read the card after a power cycle), so do not show it
+    grep -v '^  ' "$log" \
+        | grep -E '^(Connected|Uploading|Validating|Firmware Upload|SD Card Flash Error)' \
+        | grep -v 'Version Mismatch' || true
     if grep -q "Firmware Upload Complete" "$log"; then
         ok "Firmware written to the TF card"
         return 0
@@ -691,9 +695,14 @@ print_power_cycle() {
         then run
             $FINISH_CMD
 
+EOF
+    if ! grep -q 'touch_calibration' "$PRINTER_CFG" \
+            "$DATA_DIR/config/lerdge_tft.cfg" 2>/dev/null; then
+        cat <<EOF
     The Lerdge screen then shows five crosses for the touch calibration:
     tap their centers, then run SAVE_CONFIG.
 EOF
+    fi
 }
 
 # Verify the new firmware, remove it from the TF card and start Klipper
