@@ -83,7 +83,11 @@ ILI9488 / ILI9341 (определяются автоматически).
 Moonraker (Raspberry Pi, Orange Pi, другие одноплатники или ПК), с ОС на
 базе Debian (Raspberry Pi OS, Armbian, MainsailOS, FluiddPI, Debian,
 Ubuntu). Плата подключается через свой USB-порт или напрямую к UART
-(USART1, PA9/PA10).
+(USART1, PA9/PA10). Оба варианта работают одинаково: USB-порт плат Lerdge –
+это USB-UART микросхема на том же USART1, поэтому прошивка, скорость и всё
+остальное совпадают, отличается только имя порта в `printer.cfg`
+(`/dev/serial/by-id/usb-1a86_...` или `/dev/ttyUSB0` для USB, например
+`/dev/ttyS3` для UART Orange Pi).
 
 ## Как это работает
 

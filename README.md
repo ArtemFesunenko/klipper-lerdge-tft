@@ -89,7 +89,11 @@ supported by the driver too (detected automatically).
 (Raspberry Pi, Orange Pi, other single board computers or a PC) with a
 Debian based OS (Raspberry Pi OS, Armbian, MainsailOS, FluiddPI, Debian,
 Ubuntu). The board can be connected through its USB port or directly to the
-UART pins (USART1, PA9/PA10).
+UART pins (USART1, PA9/PA10). Both work the same way: the USB port of
+Lerdge boards is a USB-serial chip on the same USART1, so the firmware,
+the baud rate and everything else are identical – only the port name in
+`printer.cfg` differs (`/dev/serial/by-id/usb-1a86_...` or `/dev/ttyUSB0`
+for USB, for example `/dev/ttyS3` for the UART of an Orange Pi).
 
 ## How it works
 

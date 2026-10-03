@@ -1,6 +1,6 @@
-From d795e17493182ca997fadbc3a5408f9e3a31ead5 Mon Sep 17 00:00:00 2001
+From 354591d7377c85575ad24ab5dcb2018c7d018761 Mon Sep 17 00:00:00 2001
 From: Artem Fesunenko <body051@gmail.com>
-Date: Sat, 3 Oct 2026 16:06:57 +0300
+Date: Sat, 3 Oct 2026 20:43:19 +0300
 Subject: [PATCH 2/5] stm32: Add an optional fallback baud rate for serial
  ports
 
