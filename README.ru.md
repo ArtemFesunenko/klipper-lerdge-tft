@@ -119,7 +119,7 @@ Klipper. Установщик накладывает их на ваш Klipper в
 
 ```bash
 cd ~
-git clone https://github.com/YOUR_GITHUB_USER/klipper-lerdge-tft.git
+git clone https://github.com/ArtemFesunenko/klipper-lerdge-tft.git
 cd klipper-lerdge-tft
 ```
 

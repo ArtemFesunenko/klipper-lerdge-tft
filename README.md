@@ -126,7 +126,7 @@ Log in to the host (SSH) as the user that runs Klipper and run:
 
 ```bash
 cd ~
-git clone https://github.com/YOUR_GITHUB_USER/klipper-lerdge-tft.git
+git clone https://github.com/ArtemFesunenko/klipper-lerdge-tft.git
 cd klipper-lerdge-tft
 ```
 
